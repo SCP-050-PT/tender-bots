@@ -71,6 +71,9 @@ class CalculatorRouter:
         if not rm_total:
             return self._manual_review("Не определено количество РМ")
 
+        # v7.2.5: Передаем region для расчета средних билетов
+        region = info.get("region", "") or info.get("customer_region", "")
+
         return self.calculator.calculate_sout(
             rm_total=rm_total,
             variant=info.get("variant", 1),
@@ -82,6 +85,7 @@ class CalculatorRouter:
             is_seasonal=info.get("is_seasonal", False),
             is_annual=info.get("is_annual", False),
             transport_cost=info.get("transport_cost", 0),
+            region=region, 
         )
 
     # ==================== Обучение ====================

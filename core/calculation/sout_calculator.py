@@ -37,6 +37,7 @@ class SoutCalculator:
         regions_count: int = 1,
         transport_cost: float = 0,
         is_seasonal: bool = False,
+        region: str = "",
     ) -> CalculationResult:
         """
         Расчёт цены для клиента на СОУТ.
@@ -51,9 +52,11 @@ class SoutCalculator:
             rm_with_iii, needs_subcontractor
         )
 
-        # === Основной расчёт по варианту ===
+        # === Основной расчёт (v7.2.5: исправлен вызов) ===
+        # Убираем rm_cat_1, rm_cat_2, variant из вызова, так как метод упрощен до 213*rm
+        # Но сам метод _calc_main_price оставим с аргументами для совместимости, просто не будем их использовать
         price = (
-            self._calc_main_price(rm_total, rm_category_1, rm_category_2, variant)
+            self._calc_main_price(rm_total, rm_category_1, rm_category_2, rm_with_iii, variant) 
             * annual_mult
         )
 
@@ -63,14 +66,15 @@ class SoutCalculator:
             delivery_count,
             is_annual,
             is_urgent=(trip_days <= 5 if trip_days else False),
-        )  # уже учитывает is_annual
-        # === Командировочные (v7.2.0: годовые — тоже ×12) ===
+        )
+
+        # === Командировочные (v7.2.5: добавлен расчет билетов) ===
         travel_cost_auto, measurer_and_daily, accommodation_cost_auto, flight_cost = (
             self._calc_travel(
-                trip_days, regions_count, transport_cost, is_seasonal, cities_count
+                trip_days, regions_count, transport_cost, is_seasonal, cities_count, region # <-- ПЕРЕДАТЬ REGION
             )
         )
-        # Годовой тендер: командировочные повторяются каждый месяц
+
         if is_annual:
             travel_cost_auto *= annual_mult
             measurer_and_daily *= annual_mult
@@ -85,7 +89,7 @@ class SoutCalculator:
             + travel_cost_auto
             + measurer_and_daily
             + accommodation_cost_auto
-            + flight_cost
+            + flight_cost # <-- УЖЕ БЫЛО, НО ТЕПЕРЬ flight_cost НЕ 0
             + subcontractor_cost
         )
 
@@ -155,41 +159,18 @@ class SoutCalculator:
             return min_cost, True
         return 0, False
 
-    def _calc_main_price(
-        self, rm_total: int, rm_cat_1: int, rm_cat_2: int, variant: int
-    ) -> float:
-        """Основной расчёт по варианту СОУТ."""
-        if variant == 1:
-            main_rm = max(2, int(rm_total * 0.2))
-            if rm_cat_1 + rm_cat_2 > 0:
-                ratio_c1 = rm_cat_1 / (rm_cat_1 + rm_cat_2)
-                main_c1 = int(main_rm * ratio_c1)
-                main_c2 = main_rm - main_c1
-            else:
-                main_c1, main_c2 = main_rm, 0
-            analogy_rm = rm_total - main_rm
-            return (
-                main_c1 * self.cat["1"]["full_cost"]
-                + main_c2 * self.cat["2"]["full_cost"]
-                + analogy_rm * self.cat["1"]["analogy_cost"]
-            )
-        elif variant == 2:
-            cards_cost = (
-                rm_cat_1 * self.cat["1"]["full_cost"]
-                + rm_cat_2 * self.cat["2"]["full_cost"]
-            )
-            analogy_rm = rm_total - (rm_cat_1 + rm_cat_2)
-            return cards_cost + analogy_rm * 200
-        else:  # variant == 3
-            cards_cost = (
-                rm_cat_1 * self.cat["1"]["card_cost"]
-                + rm_cat_2 * self.cat["2"]["card_cost"]
-            )
-            remaining_rm = max(0, rm_total - rm_cat_1 - rm_cat_2)
-            protocol_sets = max(2, int(remaining_rm * 0.2))
-            return (
-                cards_cost + protocol_sets * self.costs["analogy_protocol_set"]["cost"]
-            )
+    def _calc_main_price(self, rm_total, rm_cat_1, rm_cat_2, rm_iii, variant):
+        """
+        v7.2.4: Упрощённый расчёт СОУТ для тендеров.
+        """
+        base_cost_per_rm = 213
+        main_calculation = rm_total * base_cost_per_rm
+
+        logger.info(
+            f"[SoutCalc v7.2.4] Расчёт: {rm_total} РМ × {base_cost_per_rm}₽ = "
+            f"{main_calculation:,.0f}₽ (себестоимость, тендерная цена)"
+        )
+        return main_calculation
 
     def _calc_materials(self) -> float:
         """Расчёт материалов."""
@@ -214,6 +195,7 @@ class SoutCalculator:
         transport_cost: float,
         is_seasonal: bool,
         cities_count: int,
+        region: str = "",  # <-- ДОБАВИТЬ ПАРАМЕТР
     ) -> tuple:
         """Расчёт командировочных. Возвращает (travel_auto, measurer_daily, accommodation, flight)."""
         seasonal_mult = self.travel.get("seasonal_multiplier", 2) if is_seasonal else 1
@@ -228,7 +210,29 @@ class SoutCalculator:
         accommodation_cost_auto = (
             max(0, trip_days - 1) * trips * accommodation_rate * seasonal_mult
         )
-        flight_cost = transport_cost if transport_cost > 0 else 0
+
+        # v7.2.5: РАСЧЁТ БИЛЕТОВ (Средняя заглушка)
+        # Если транспорт не указан явно (transport_cost=0) и регион не офисный (Екб), закладываем среднюю цену
+        office_cities = [
+            "екатеринбург",
+            "верхняя пышма",
+            "березовский",
+            "арти",
+        ]  # можно расширить
+        is_office = (
+            any(city in region.lower() for city in office_cities) if region else False
+        )
+
+        flight_cost = 0
+        if transport_cost > 0:
+            flight_cost = transport_cost
+        elif not is_office and trips > 0:
+            # Средняя цена плацкарта/самолета туда-обратно ~8000₽
+            avg_ticket_price = 8000
+            flight_cost = avg_ticket_price * trips * seasonal_mult
+            logger.info(
+                f"[SoutCalc v7.2.5] Билеты (среднее): {flight_cost}₽ ({trips} выездов × {avg_ticket_price}₽)"
+            )
 
         if cities_count > 5 and regions_count == 1:
             logger.warning(

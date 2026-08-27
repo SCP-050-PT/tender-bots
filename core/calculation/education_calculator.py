@@ -136,6 +136,25 @@ class EducationCalculator:
                     logger.info(
                         f"[EducationCalc] Авто: ОТ → protocols_count={students_count}"
                     )
+
+                    # v7.2.4: ПРИНУДИТЕЛЬНЫЙ ДИСТАНТ ДЛЯ ОТ
+                    # Если в ТЗ есть "дистанц" или нет слов "очно/полигон" -> это дистант
+                    # Источник: "расчет_цен_для_участия_в_тендерах.docx" п.1.3
+                    has_distance_kw = any(kw in text_lower for kw in [
+                        "дистанц", "электронн", "онлайн", "distance", "remote"
+                    ])
+                    has_onsite_kw = any(kw in text_lower for kw in [
+                        "очно", "очная форма", "полигон", "выездное обучение", 
+                        "практическое занятие", "тренировочный полигон"
+                    ])
+
+                    # Если явно указан дистант ИЛИ не указана очка -> считаем дистантом
+                    if has_distance_kw or not has_onsite_kw:
+                        is_distance = True
+                        logger.info(
+                            f"[EducationCalc v7.2.4] Авто: ОТ без 'очно' → "
+                            f"is_distance=True (принудительный дистант)"
+                        )
                 elif any(
                     kw in text_lower
                     for kw in [
@@ -205,11 +224,36 @@ class EducationCalculator:
         # Накладные
         overhead_cost = self.overhead["base"]["cost"] * annual_mult
 
-        # Труд
-        methodist_cost = self.labor["methodist_hour"]["cost"] * 3 * annual_mult
-        ro_cost = self.labor["ro_hour"]["cost"] * 1 * annual_mult
-        portal_cost = self.labor["portal_access"]["cost"] * students_count * annual_mult
-        labor_cost = methodist_cost + ro_cost + portal_cost
+        # === Трудозатраты (v7.2.3: по калькулятору Александры) ===
+        # Нагрузка тендерного специалиста (все типы) — из "для бота тенедры.docx"
+        specialist_cost = 3 * 100 * annual_mult  # 3ч × 100₽ = 300₽
+
+        # Часы методиста (только обучение) — из Калькулятор тендеры.xlsx
+        # "В формуле учитывается 3 часа работы методиста и РО"
+        methodist_hours = 3
+        methodist_rate = self.labor["methodist_hour"]["cost"]  # 227₽
+        methodist_cost = methodist_hours * methodist_rate * annual_mult  # 681₽
+
+        # Часы РО (только обучение) — из Калькулятор тендеры.xlsx
+        ro_hours = 3
+        ro_rate = self.labor["ro_hour"]["cost"]  # 600₽
+        ro_cost = ro_hours * ro_rate * annual_mult  # 1800₽
+
+        # Портал — за каждого слушателя
+        portal_cost = (
+            self.labor["portal_access"]["cost"] * students_count * annual_mult
+        )  # 57₽ × N
+
+        labor_cost = specialist_cost + methodist_cost + ro_cost + portal_cost
+
+        logger.info(
+            f"[EducationCalc v7.2.3] Трудозатраты: "
+            f"специалист={specialist_cost}₽, "
+            f"методист={methodist_cost}₽ ({methodist_hours}ч×{methodist_rate}₽), "
+            f"РО={ro_cost}₽ ({ro_hours}ч×{ro_rate}₽), "
+            f"портал={portal_cost}₽ ({students_count}×{self.labor['portal_access']['cost']}₽), "
+            f"итого={labor_cost}₽"
+        )
 
         # === Очные затраты ===
         full_time_cost = 0

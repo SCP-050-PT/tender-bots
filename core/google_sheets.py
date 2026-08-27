@@ -43,15 +43,14 @@ SHEET_COLUMNS = [
     "Цена предложения",  # N
     "Возможности экономии",  # O
     "Решение по участию",  # P
-    "Комментарий от ИИ-агента",  # Q
-    "Рекомендации",  # R
-    "Комментарии руководителя отдела по участию",  # S
-    "Дата заключения контракта",  # T
-    "Дата выполнения работ",  # U
-    "Результат",  # V
+    "Расчёты",  # Q ← НОВАЯ
+    "Комментарий от ИИ-агента",  # R
+    "Рекомендации",  # S
+    "Комментарии руководителя отдела по участию",  # T
+    "Дата заключения контракта",  # U
+    "Дата выполнения работ",  # V
+    "Результат",  # W
 ]
-
-BOT_COLUMNS_RANGE = "A:V"
 
 BOT_COLUMNS_RANGE = "A:W"
 
@@ -289,7 +288,7 @@ class GoogleSheetsManager:
         try:
             # ← v6.0: Расширен диапазон до T
             self.worksheet.format(
-                f"A{row_number}:V{row_number}", 
+                f"A{row_number}:W{row_number}", 
                 {"backgroundColor": {"red": 0.95, "green": 0.8, "blue": 0.8}},
             )
         except Exception as e:
@@ -299,7 +298,7 @@ class GoogleSheetsManager:
         try:
             # ← v6.0: Расширен диапазон до T
             self.worksheet.format(
-                f"A{row_number}:V{row_number}",
+                f"A{row_number}:W{row_number}",
                 {"backgroundColor": {"red": 0.8, "green": 0.95, "blue": 0.8}},
             )
         except Exception as e:
@@ -309,7 +308,7 @@ class GoogleSheetsManager:
         try:
             # ← v6.0: Расширен диапазон до T
             self.worksheet.format(
-                f"A{row_number}:V{row_number}",
+                f"A{row_number}:W{row_number}",
                 {"backgroundColor": {"red": 1.0, "green": 0.95, "blue": 0.8}},
             )
         except Exception as e:

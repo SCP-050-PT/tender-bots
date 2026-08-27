@@ -236,6 +236,105 @@ def _get_guarantee_info(detail, analysis) -> tuple:
     return app_guarantee, contract_guarantee, guarantee_method
 
 
+def _build_calculation_breakdown(analysis) -> str:
+    """Формирует детальную разбивку расчётов для колонки Q."""
+    if not hasattr(analysis, "details") or analysis.details is None:
+        return ""
+
+    d = analysis.details
+    if isinstance(d, dict):
+        details = d
+    else:
+        details = {k: getattr(d, k, None) for k in dir(d) if not k.startswith("_")}
+
+    tender_type = details.get("type", analysis.tender_type)
+    lines = []
+
+    if tender_type == "sout":
+        lines.append(f"📊 СОУТ (Упрощённая формула)")  # <-- Изменили заголовок
+        lines.append(
+            f"РМ всего: {details.get('rm_total', '?')} × 213₽"
+        )  # <-- Убрали варианты
+        lines.append(f"База (РМ×213): {details.get('main_calculation', 0):,.0f}₽")
+        lines.append(f"Материалы: {details.get('materials_cost', 0):,.0f}₽")
+        lines.append(f"Почта: {details.get('delivery_cost', 0):,.0f}₽")
+
+        # Транспортный блок
+        lines.append(f"Командировочные:")
+        lines.append(f"  Выезд/Бензин: {details.get('travel_cost', 0):,.0f}₽")
+        lines.append(
+            f"  Замерщик+Суточные: {details.get('measurer_and_daily', 0):,.0f}₽"
+        )
+        lines.append(f"  Проживание: {details.get('accommodation_cost', 0):,.0f}₽")
+        lines.append(
+            f"  Билеты (среднее): {details.get('flight_cost', 0):,.0f}₽"
+        )  
+
+        lines.append(
+            f"Города: {details.get('cities_count', 1)}, Регионы: {details.get('regions_count', 1)}"
+        )
+
+    elif tender_type == "education":
+        lines.append(
+            f"📚 Обучение | {'Дистант' if details.get('is_distance') else 'Очно'}"
+        )
+        lines.append(f"Слушателей: {details.get('students_count', '?')}")
+        lines.append(f"Удостоверения: {details.get('certificates', 0)} × 60₽")
+        lines.append(f"Дипломы: {details.get('diplomas', 0)} × 265₽")
+        lines.append(f"Свидетельства раб.: {details.get('worker_certs', 0)} × 80₽")
+        lines.append(f"Повыш. квалиф.: {details.get('qual_certs', 0)} × 130₽")
+        lines.append(f"Протоколы: {details.get('protocols_count', 0)} × 3.65₽")
+        lines.append(f"Документы: {details.get('docs_cost', 0):,.0f}₽")
+        lines.append(f"Материалы: {details.get('materials_cost', 0):,.0f}₽")
+        lines.append(f"Трудозатраты: {details.get('labor_cost', 0):,.0f}₽")
+        lines.append(f"  (специалист 300₽ + методист 681₽ + РО 1800₽ + портал)")
+        lines.append(f"Доставка: {details.get('delivery_cost', 0):,.0f}₽")
+        lines.append(f"Накладные: {details.get('overhead_cost', 0):,.0f}₽")
+        if not details.get("is_distance"):
+            lines.append(f"Очные затраты: {details.get('full_time_cost', 0):,.0f}₽")
+            lines.append(f"  Преподаватель: {details.get('teacher_days', 0)} дн.")
+            lines.append(f"  Транспорт: {details.get('transport_cost', 0):,.0f}₽")
+            lines.append(
+                f"  Проживание: {details.get('accommodation_cost', 0) if details.get('accommodation_cost') else 0:,.0f}₽"
+            )
+            lines.append(f"  Аренда: {details.get('venue_cost', 0):,.0f}₽")
+            lines.append(f"  Манекен: {details.get('manikin_days', 0)} дн.")
+
+    elif tender_type == "opr":
+        lines.append(f"📋 ОПР")
+        lines.append(
+            f"РМ/должностей: {details.get('rm_total', details.get('positions_count', '?'))}"
+        )
+        lines.append(f"СИЗ/ДСИЗ/ИОТ: {details.get('rm_total', 0)} × 200₽")
+        lines.append(f"Материалы: {details.get('materials_cost', 0):,.0f}₽")
+        lines.append(f"Почта: {details.get('delivery_cost', 0):,.0f}₽")
+        lines.append(f"Маржа: 30%")
+
+    elif tender_type == "plk":
+        lines.append(f"🔬 ПЛК")
+        lines.append(f"Точек: {details.get('points_count', '?')}")
+        lines.append(f"Себестоимость/точка: 41.9₽")
+        lines.append(f"Материалы: {details.get('materials_cost', 0):,.0f}₽")
+        lines.append(f"Почта: {details.get('delivery_cost', 0):,.0f}₽")
+        plk_travel = details.get("travel_cost", 0) or details.get("transport_cost", 0)
+        lines.append(f"Транспорт: {plk_travel:,.0f}₽")
+
+    elif tender_type == "testing":
+        lines.append(f"🧪 Testing (ПЛК-калькулятор)")
+        lines.append(f"Точек: {details.get('points_count', '?')}")
+
+    else:
+        lines.append(f"❓ Тип: {tender_type}")
+
+    # Общие итоговые строки
+    lines.append(f"──────────────")
+    lines.append(f"Себестоимость: {analysis.cost_price:,.0f}₽")
+    lines.append(f"Маржа: {analysis.margin_percent:.1f}%")
+    lines.append(f"Цена: {analysis.recommended_price:,.0f}₽")
+
+    return "\n".join(lines)
+
+
 def _build_sheets_row(analysis, detail, tender) -> dict:
     """Формирует строку для Google Sheets. v7.2.1: новый порядок колонок + фиксы."""
     quantity = _get_quantity(analysis)
@@ -312,6 +411,7 @@ def _build_sheets_row(analysis, detail, tender) -> dict:
         "Цена предложения": _format_price(analysis.recommended_price),  # N
         "Возможности экономии": "",  # O ← ручное
         "Решение по участию": decision_override,  # Q
+        "Расчёты": _build_calculation_breakdown(analysis),
         "Комментарий от ИИ-агента": ai_comment,  # R ← полный анализ ИИ
         "Рекомендации": _build_short_recommendation(analysis),
         "Комментарии руководителя отдела по участию": "",  # T ← ручное
@@ -369,9 +469,10 @@ def run_parse_only(max_pages: int = None, max_results: int = None):
 def run_analyze(
     max_pages: int = None, max_results: int = None, skip_detail: bool = False
 ):
-    """Полный анализ с LLM. v7.0.0: type_hint только через TypeService."""
+    """Полный анализ с LLM. v7.2.5: исправлен порядок кэша и лимитов."""
     logger.info("=" * 60)
     logger.info("🤖 РЕЖИМ: Полный анализ с LLM")
+
     # === v7.2.2: Лимиты + очистка ===
     limiter = DailyLimiter()
     logger.info(limiter.get_status())
@@ -381,7 +482,7 @@ def run_analyze(
         logger.error(f"🚫 Запуск отменён: {reason}")
         return [], []
 
-    # Очистка старых файлов
+    # Очистка старых файлов (downloads), но НЕ кэша ID
     limiter.cleanup_all()
     logger.info("=" * 60)
 
@@ -437,8 +538,25 @@ def run_analyze(
     logger.info("🔍 Начинаю поиск тендеров...")
     results = []
     sheets_rows = []
+    duplicates_skipped = 0  # Счётчик дублей
 
     for tender in searcher.search(max_pages=max_pages, max_results=max_results):
+
+        # ==========================================================
+        # v7.2.5: РАННЯЯ ПРОВЕРКА КЭША (ДО ПАРСИНГА!)
+        # ==========================================================
+        if limiter.is_cached(tender.tender_id):
+            logger.info(f"   ⏭️ Кэш: {tender.tender_id} уже обрабатывался, пропуск")
+            duplicates_skipped += 1
+            continue
+
+        # ==========================================================
+        # v7.2.5: ПРОВЕРКА ЛИМИТА ЗА ЗАПУСК (ДО ПАРСИНГА!)
+        # ==========================================================
+        if len(results) >= limiter.MAX_PER_RUN:
+            logger.info(f"   ⏹️ Лимит за запуск ({limiter.MAX_PER_RUN}) достигнут")
+            break
+
         logger.info(f"\n{'-' * 60}")
         logger.info(f"🆔 {tender.tender_id} | {tender.law}")
         logger.info(f"📌 {tender.title[:80]}...")
@@ -476,7 +594,6 @@ def run_analyze(
                         f"   🔒 Обеспечение: {detail.application_guarantee or 'не указано'}"
                     )
 
-                    # Обработка документов через DocumentProcessor
                     documents_text = ""
                     if detail.documents:
                         try:
@@ -523,7 +640,6 @@ def run_analyze(
 
         # === ШАГ 2: Fallback — упрощённый текст ===
         if not tender_text:
-            # v7.0.0: включаем documents_text даже в fallback
             doc_part = ""
             if documents_text and len(documents_text) > 100:
                 doc_part = f"\n\nТЕКСТ ДОКУМЕНТОВ:\n{documents_text[:12000]}"
@@ -559,6 +675,9 @@ def run_analyze(
                     or "",
                     "nmck": detail.nmck or tender.nmck or 0,
                     "deadline_date": detail.deadline_date or tender.deadline_date or "",
+                    "region": detail.customer_region
+                    or getattr(tender, "region", "")
+                    or "",
                     "deadline_days": _parse_deadline_to_days(
                         detail.deadline_date or tender.deadline_date or ""
                     ),
@@ -620,8 +739,6 @@ def run_analyze(
                     detail, "needs_subcontractor", False
                 )
 
-            # v7.0.0: type_hint ТОЛЬКО из detail (DetailedParser уже использует TypeService)
-            # Убран _detect_type_from_title() — дубль TypeService
             type_hint = detail.tender_type_hint if detail else None
 
             logger.info(
@@ -633,7 +750,8 @@ def run_analyze(
                 f"regions_count={tender_info.get('regions_count', 'N/A')}, "
                 f"type_hint={type_hint}"
             )
-            # v7.1.0: Проверка search title на ОПР/testing ДО передачи в analyzer
+
+            # v7.1.0: Проверка search title
             if not type_hint and tender.title:
                 from core.services.type_service import TypeService
 
@@ -644,6 +762,18 @@ def run_analyze(
                         type_hint = _ttype
                         logger.info(f"[v7.1.0] Type hint из search title: {_ttype}")
                         break
+
+            # ==========================================================
+            # v7.2.4: ПРИОРИТЕТ EDUCATION НАД SOUT (ИСПРАВЛЕНО)
+            # ==========================================================
+            if detail and (detail.students_count or 0) > 0 and type_hint == "sout":
+                logger.warning(
+                    f"[v7.2.4] Override: sout → education "
+                    f"(КТРУ дал {detail.students_count} слушателей, "
+                    f"приоритет обучения над СОУТ)"
+                )
+                type_hint = "education"
+
             analysis = analyzer.analyze(
                 tender_info=tender_info,
                 documents_text=documents_text or tender_text,
@@ -666,15 +796,12 @@ def run_analyze(
 
             row = _build_sheets_row(analysis, detail, tender)
             sheets_rows.append(row)
-            # === v7.2.2: Кэш дубликатов (пропуск уже обработанных) ===
-            if limiter.is_cached(tender.tender_id):
-                logger.info(f"   ⏭️ Кэш: {tender.tender_id} уже обрабатывался, пропуск")
-                continue
 
-            # === v7.2.2: Лимит за запуск ===
-            if len(results) >= limiter.MAX_PER_RUN:
-                logger.info(f"   ⏹️ Лимит за запуск: {limiter.MAX_PER_RUN} тендеров")
-                break
+            # ==========================================================
+            # v7.2.5: ДОБАВЛЕНИЕ В КЭШ (ПОСЛЕ УСПЕШНОГО АНАЛИЗА)
+            # ==========================================================
+            limiter.add_to_cache(tender.tender_id)
+
             if sheets_manager:
                 try:
                     success = sheets_manager.add_tender_to_top(
@@ -726,6 +853,7 @@ def run_analyze(
                 {
                     "analysis_date": datetime.now().isoformat(),
                     "total": len(results),
+                    "duplicates_skipped": duplicates_skipped,
                     "results": results,
                 },
                 f,
@@ -744,7 +872,8 @@ def run_analyze(
         print(f"\n{'=' * 60}")
         print(f"📋 СВОДКА")
         print(f"{'=' * 60}")
-        print(f"Всего обработано: {len(results)}")
+        print(f"Всего уникальных: {len(results)}")
+        print(f"Дубликатов пропущено: {duplicates_skipped}")
 
         decisions = {}
         for r in results:
@@ -766,9 +895,11 @@ def run_analyze(
             print(f"{emoji} {risk}: {count}")
         print(f"{'=' * 60}")
 
-    logger.info(f"\n✅ Обработано тендеров: {len(results)}")
-    # === v7.2.2: Запись счётчиков ===
-    limiter.record_tenders(len(results))
+    # === v7.2.5: ЗАПИСЬ СЧЁТЧИКОВ (ТОЛЬКО УНИКАЛЬНЫЕ) ===
+    unique_count = len(results)
+    limiter.record_tenders(unique_count)
+    logger.info(f"📊 Уникальных: {unique_count}, дубликатов: {duplicates_skipped}")
+
     return results, sheets_rows
 
 

@@ -1,6 +1,6 @@
 {
-  "version": "1.6.1",
-  "updated": "2026-08-10",
+  "version": "1.7.1",
+  "updated": "2026-08-24",
   "currency": "RUB",
   "global_limits": {
     "min_contract_sum": 10000,
@@ -66,7 +66,8 @@
       "ro_hour": {
         "name": "Час работы РО (руководителя образовательной организации)",
         "cost": 600,
-        "unit": "час"
+        "unit": "час",
+        "note": "В формуле учитывается 3 часа работы РО"
       },
       "portal_access": {
         "cost": 57,
@@ -108,7 +109,7 @@
           4000
         ],
         "fuel_cost_per_km": 5,
-        "daily_allowance": 1000
+        "daily_allowance": 500
       }
     },
     "rates": {
@@ -118,14 +119,14 @@
         "note": "Ставка преподавателя за день (из ТЗ, не авто)"
       },
       "manikin_daily": {
-        "cost": 15000,
+        "cost": 5000,
         "unit": "день",
-        "note": "Аренда манекена/тренажёра (из ТЗ, не авто)"
+        "note": "Аренда манекена/тренажёра (диапазон 3000-10000, берем среднее 5000)"
       },
       "venue_daily": {
-        "cost": 3000,
+        "cost": 5000,
         "unit": "день",
-        "note": "Аренда помещения (из ТЗ, не авто)"
+        "note": "Аренда помещения (минимум из диапазона 5000-15000)"
       },
       "transport_fixed": {
         "cost": 10000,
@@ -139,16 +140,20 @@
     }
   },
   "sout": {
+    "base_cost_per_rm": 213,
+    "note_base_cost": "Фиксированная себестоимость для тендеров (бумага 23 + краска 50 + эксперт 90 + замерщик 50). Цены 900/1800 - только для коммерческих договоров.",
     "category_rates": {
       "1": {
         "full_cost": 900,
         "card_cost": 1500,
-        "analogy_cost": 100
+        "analogy_cost": 100,
+        "note": "ТОЛЬКО ДЛЯ КОММЕРЧЕСКИХ ДОГОВОРОВ. В тендерах использовать base_cost_per_rm (213)."
       },
       "2": {
         "full_cost": 1800,
         "card_cost": 2000,
-        "analogy_cost": 100
+        "analogy_cost": 100,
+        "note": "ТОЛЬКО ДЛЯ КОММЕРЧЕСКИХ ДОГОВОРОВ. В тендерах использовать base_cost_per_rm (213)."
       }
     },
     "analogy_protocol_set": {
@@ -173,29 +178,29 @@
       "expert_per_rm": {
         "cost": 90,
         "unit": "РМ",
-        "note": "СЕБЕСТОИМОСТЬ — не входит в цену клиента. Используется только для справки, не в расчёте цены"
+        "note": "СЕБЕСТОИМОСТЬ — входит в base_cost_per_rm (213)."
       },
       "expert_per_rm_high": {
         "cost": 214.5,
         "unit": "РМ",
-        "note": "СЕБЕСТОИМОСТЬ — не входит в цену клиента. Используется только для справки, не в расчёте цены"
+        "note": "СЕБЕСТОИМОСТЬ — справка."
       },
       "measurer_per_rm": {
         "cost": 50,
         "unit": "РМ",
-        "note": "СЕБЕСТОИМОСТЬ — не входит в цену клиента"
+        "note": "СЕБЕСТОИМОСТЬ — входит в base_cost_per_rm (213)."
       },
       "expert_fixed": {
         "cost": 3600,
         "unit": "услуга",
-        "note": "СЕБЕСТОИМОСТЬ — не входит в цену клиента"
+        "note": "СЕБЕСТОИМОСТЬ — справка."
       }
     },
     "delivery": {
       "post_russia": {
-        "cost": 500,
+        "cost": 1000,
         "unit": "отправка",
-        "note": "Базовая стоимость"
+        "note": "Базовая стоимость для СОУТ"
       },
       "post_russia_high": {
         "cost": 1000,
@@ -361,7 +366,7 @@
         "unit": "отправка"
       }
     },
-    "margin_percent": 10
+    "margin_percent": 30
   },
   "guarantees": {
     "application": {
@@ -442,7 +447,7 @@
     },
     "daily_allowance": {
       "standard": 500,
-      "education_full_time": 1000
+      "education_full_time": 500
     },
     "ticket_search": {
       "sites": [
@@ -527,11 +532,27 @@
   },
   "notes": [
     {
-      "version": "1.6.1",
-      "date": "2026-08-10",
+      "version": "1.7.1",
+      "date": "2026-08-24",
       "changes": [
-        "opr.margin_percent: 30 → 10 (соответствует бизнес-логике)",
-        "plk.travel.transport_default: удалено (теперь расчёт по километражу)"
+        "sout: добавлен base_cost_per_rm=213 (фиксированная цена для тендеров, вместо 900/1800)",
+        "education.rates.manikin_daily: 15000 → 5000 (по ТЗ Александры: 3000-10000)",
+        "education.forms.full_time.daily_allowance: 1000 → 500 (по ТЗ: суточные всегда 500)",
+        "education.rates.venue_daily: 3000 → 5000 (по ТЗ: аренда 5000-15000)",
+        "opr.margin_percent: 10 → 30 (по калькулятору Александры)",
+        "travel.daily_allowance.education_full_time: 1000 → 500"
+      ]
+    },
+    {
+      "version": "1.7.0",
+      "date": "2026-08-24",
+      "changes": [
+        "opr.margin_percent: 10 → 30 (по калькулятору Александры: 'Маржа 30%')",
+        "education: добавлены methodist_hour и ro_hour в расчёт",
+        "document_config: убрано 'извещение' из чёрного списка (223-ФЗ ТЗ)",
+        "type_service: добавлены 'проверка знаний' keywords",
+        "guard_engine: расширен список запрещённых направлений",
+        "sout.delivery.post_russia: 500 → 1000 (по калькулятору СОУТ)"
       ]
     }
   ]
