@@ -25,22 +25,20 @@ LOG_DIR.mkdir(exist_ok=True)
 try:
     from loguru import logger
 
-    # Убираем дефолтный хендлер loguru чтобы не было дублей
     logger.remove()
 
-    # Консольный лог (теперь показывает INFO)
+    # v7.3.0: Консольный лог INFO
     logger.add(
         sys.stdout,
-        level="INFO",  # <-- БЫЛО WARNING, СТАЛО INFO
+        level="INFO",
         format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | {message}",
     )
-    
-    # Но при этом оставляем INFO для главного файла, чтобы видеть начало тендера
+
     logger.add(
         sys.stdout,
         level="DEBUG",
         format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | {message}",
-        filter=lambda record: record["name"] == "__main__"
+        filter=lambda record: record["name"] == "__main__",
     )
 except ImportError:
     import logging
