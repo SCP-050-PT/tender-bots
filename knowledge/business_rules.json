@@ -1,0 +1,117 @@
+{
+  "version": "1.1.0",
+  "forbidden_directions": [
+    {
+      "id": "mchs_license",
+      "name": "Лицензия МЧС на пожарную безопасность",
+      "keywords": ["лицензия мчс", "пожарная лицензия"],
+      "action": "reject",
+      "reason": "Нет лицензии МЧС"
+    },
+    {
+      "id": "prom_bez_expertiza",
+      "name": "Экспертиза промышленной безопасности",
+      "keywords": ["экспертиза промышленной безопасности", "эпб"],
+      "action": "reject",
+      "reason": "Нет аккредитации на экспертизу промбезопасности"
+    },
+    {
+      "id": "prom_bez_general",
+      "name": "Промбезопасность (общее)",
+      "keywords": ["промбезопасность", "промышленная безопасность"],
+      "action": "reject",
+      "reason": "Требуется лицензия Ростехнадзора"
+    },
+    {
+      "id": "med_workers",
+      "name": "Медицинские работники",
+      "keywords": ["медицинские работники", "медперсонал"],
+      "action": "reject",
+      "reason": "Не работаем с медицинскими профилями"
+    },
+    {
+      "id": "info_security",
+      "name": "Информационная безопасность",
+      "keywords": ["информационная безопасность", "иб", "кибербезопасность"],
+      "action": "reject",
+      "reason": "Нет компетенций в ИБ",
+      "exception": "Допустимо только в контексте СОУТ/ОПР"
+    },
+    {
+      "id": "driver_license",
+      "name": "Водительские права",
+      "keywords": ["водительские права", "обучение вождению"],
+      "action": "reject",
+      "reason": "Не выдаём водительские права"
+    },
+    {
+      "id": "civil_defense",
+      "name": "Гражданская оборона / Категорированные организации",
+      "keywords": ["гражданская оборона", "категорированные организации", "гостайна", "фсб"],
+      "action": "reject",
+      "reason": "Требуется лицензия ФСТЭК/ФСБ или допуск к гостайне"
+    },
+    {
+      "id": "armed_guards",
+      "name": "Охранники с оружием",
+      "keywords": ["охранники с оружием", "чоп"],
+      "action": "reject",
+      "reason": "Требуется лицензия ЧОП"
+    },
+    {
+      "id": "tech_diagnostics",
+      "name": "Техническая диагностика оборудования",
+      "keywords": ["техническая диагностика", "дефектоскопия", "ндт"],
+      "action": "reject",
+      "reason": "Требуется лицензия Ростехнадзора"
+    },
+    {
+      "id": "water_bio",
+      "name": "Исследования воды / Биология / Смывы",
+      "keywords": ["исследование воды", "питьевая вода", "смывы", "гельминты", "биология", "микробиология"],
+      "action": "reject",
+      "reason": "Нет аккредитации на биологические и химические анализы воды"
+    }
+  ],
+  "red_flags": [
+    {
+      "id": "low_margin",
+      "name": "Маржа ниже минимума",
+      "condition": "margin_percent < 10",
+      "level": "high",
+      "message": "Маржа ниже 10% — риск убыточности"
+    },
+    {
+      "id": "cost_near_nmck",
+      "name": "Себестоимость близка к НМЦК",
+      "condition": "cost_price / nmck > 0.85",
+      "level": "high",
+      "message": "Себестоимость > 85% от НМЦК — нет пространства для маржи"
+    },
+    {
+      "id": "nmck_below_cost",
+      "name": "НМЦК ниже себестоимости",
+      "condition": "cost_price > nmck",
+      "level": "high",
+      "message": "НМЦК ниже расчётной себестоимости — участие невыгодно"
+    },
+    {
+      "id": "tight_deadline",
+      "name": "Сверхсжатые сроки",
+      "condition": "deadline_days < 5",
+      "level": "high",
+      "message": "Срок исполнения < 5 дней — критический риск"
+    },
+    {
+      "id": "complex_logistics",
+      "name": "Сложная логистика",
+      "condition": "addresses_count > 3",
+      "level": "medium",
+      "message": "Несколько адресов в разных городах — высокие транспортные расходы"
+    }
+  ],
+  "decision_logic": {
+    "recommended": "margin_percent >= 10 AND no_forbidden_directions AND risk_level != high",
+    "reject": "has_forbidden_directions OR margin_percent < 10 OR risk_level == high"
+  }
+}

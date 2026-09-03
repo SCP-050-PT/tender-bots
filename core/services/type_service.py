@@ -207,6 +207,50 @@ class TypeService:
                         f"[{self.VERSION}] Тип из title: {ttype} ('{purchase_name[:60]}...')"
                     )
                     return ttype, "title_heuristic", "heuristic"
+        # === v7.3.1: Проверка на комбо-тендер по тексту ===
+        text_lower = documents_text.lower() if documents_text else ""
+        has_sout_kw = any(
+            kw in text_lower
+            for kw in ["специальная оценка", "соут", "оценка условий труда"]
+        )
+        has_opr_kw = any(
+            kw in text_lower
+            for kw in [
+                "оценка профессиональных рисков",
+                "опр",
+                "профессиональных рисков",
+            ]
+        )
+        has_plk_kw = any(
+            kw in text_lower
+            for kw in [
+                "производственный контроль",
+                "плк",
+                "лабораторные исследования",
+                "замеры",
+            ]
+        )
+
+        combo_count = sum([has_sout_kw, has_opr_kw, has_plk_kw])
+        if combo_count >= 2:
+            logger.info(f"[{self.VERSION}] Обнаружен комбо-тендер ({combo_count} типа)")
+            return "combined", "text_heuristic_combo", "heuristic"
+
+        # === v7.3.1: Защита от ложного ОПР (лаборатория) ===
+        if tender_type_hint == "opr" and any(
+            kw in text_lower
+            for kw in [
+                "лабораторные исследования",
+                "испытания проб",
+                "сточной воды",
+                "атмосферного воздуха",
+                "санитарно-эпидемиологических",
+            ]
+        ):
+            logger.warning(
+                f"[{self.VERSION}] Ложный ОПР: обнаружены признаки лаборатории. Меняю на plk/testing"
+            )
+            tender_type_hint = "plk"  # или testing
 
         # Шаг 2: LLM классификация (высокий confidence)
         if llm_classification and llm_confidence >= 0.7:

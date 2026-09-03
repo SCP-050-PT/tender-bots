@@ -15,7 +15,7 @@ google-api-python-client==2.108.0
 requests==2.32.3
 urllib3==2.1.0
 charset-normalizer==3.3.2
-
+openai>=1.50.0,<2.0.0
 # ============ DOCUMENT PARSING ============
 pdfplumber==0.10.0
 python-docx==1.1.0

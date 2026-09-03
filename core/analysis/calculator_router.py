@@ -57,8 +57,18 @@ class CalculatorRouter:
     # ==================== СОУТ ====================
     def _calc_sout(self, info: Dict[str, Any]) -> CalculationResult:
         rm_total = info.get("rm_total", 0)
+        
+        # === v7.3.1: Приоритет LLM над fallback ===
+        # Если LLM нашёл количество, не используем fallback по НМЦК
         if not rm_total:
-            return self._manual_review("Не определено количество РМ")
+            nmck = info.get("nmck", 0)
+            if nmck > 0 and not info.get("llm_found_rm"): # Флаг, что LLM не нашёл
+                estimated_rm = int(nmck / 1200)
+                logger.warning(f"[{self.VERSION}] СОУТ: кол-во не найдено. Оценка по НМЦК: {estimated_rm} РМ")
+                rm_total = estimated_rm
+                info["needs_manual_review"] = True
+            else:
+                return self._manual_review("Не определено количество РМ")
 
         region = info.get("region", "") or info.get("customer_region", "")
 

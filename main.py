@@ -36,7 +36,7 @@ try:
 
     logger.add(
         sys.stdout,
-        level="DEBUG",
+        level="WARNING",
         format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | {message}",
         filter=lambda record: record["name"] == "__main__",
     )
@@ -519,18 +519,23 @@ def run_analyze(
         except Exception as e:
             logger.warning(f"⚠️ DetailedParser не инициализирован: {e}")
 
+        # === ПОЛНОЕ ОТКЛЮЧЕНИЕ GOOGLE SHEETS ДЛЯ ТЕСТА ===
     sheets_manager = None
-    sheets_enabled = getattr(settings, "GOOGLE_SHEETS_ENABLED", True)
-    if sheets_enabled:
-        try:
-            from core.google_sheets import get_sheets_manager
+    logger.warning(
+        "⚠️ ВНИМАНИЕ: Запись в Google Sheets ПРИНУДИТЕЛЬНО ОТКЛЮЧЕНА в коде (тестовый режим)"
+    )
 
-            sheets_manager = get_sheets_manager()
-            logger.info("📊 Google Sheets подключен")
-        except Exception as e:
-            logger.warning(f"⚠️ Google Sheets не подключен: {e}")
-    else:
-        logger.info("📊 Google Sheets отключен в настройках")
+    # Закомментируйте или удалите старый блок:
+    # sheets_enabled = getattr(settings, "GOOGLE_SHEETS_ENABLED", True)
+    # if sheets_enabled:
+    #     try:
+    #         from core.google_sheets import get_sheets_manager
+    #         sheets_manager = get_sheets_manager()
+    #         logger.info("📊 Google Sheets подключен")
+    #     except Exception as e:
+    #         logger.warning(f"⚠️ Google Sheets не подключен: {e}")
+    # else:
+    #     logger.info("📊 Google Sheets отключен в настройках")
 
     logger.info("🔍 Начинаю поиск тендеров...")
     results = []

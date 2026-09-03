@@ -24,6 +24,11 @@ class Settings:
     YANDEX_API_KEY: str = os.getenv("YANDEX_API_KEY", "")
     YANDEX_GPT_MODEL: str = os.getenv("YANDEX_GPT_MODEL", "yandexgpt-lite")
 
+    # === YANDEX AGENT ===
+    YANDEX_AGENT_API_KEY: str = os.getenv("YANDEX_AGENT_API_KEY", "")
+    YANDEX_AGENT_ID: str = os.getenv("YANDEX_AGENT_ID", "")
+    USE_AI_AGENT: bool = os.getenv("USE_AI_AGENT", "False").lower() == "true"
+
     # === GOOGLE SHEETS ===
     GOOGLE_SHEETS_ID: str = os.getenv(
         "GOOGLE_SHEETS_ID", "1taImEQire-tOjGT85xKglsTQ4PH9cvzryqaxARPKAk8"
