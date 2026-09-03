@@ -6,6 +6,9 @@
   - Убрано дублирование HTTP-логики (make_request, 429, backoff)
   - Теперь используется session_manager.make_request()
   - Убраны приватные вызовы _update_session_headers
+ИСПРАВЛЕНО (v7.2.9):
+  - Разрешен конфликт ключевых слов ЭТЛ (только в черном списке).
+  - Добавлены ключевые слова для ПЛК/Санитарного контроля.
 """
 
 import sys
@@ -73,7 +76,39 @@ def _load_exclude_keywords() -> List[str]:
         "техническая диагностика",
         "промбезопасность",
         "промбезопасности",
+        # === v7.2.8: Ивент-менеджмент и форумы (не наш профиль) ===
+        "организации и проведению",
+        "образовательный форум",
+        "форум для",
+        "питание",
+        "кофе-брейк",
+        "трансфер",
+        "туристического класса",
+        "творческих коллективов",
+        "видеоролик",
+        "деловая игра",
+        "оценку компетенций",
+        # === v7.2.8: Электролаборатория (НЕ НАШ ПРОФИЛЬ) ===
+        "замеров сопротивления изоляции",
+        "измерения заземления",
+        "сопротивления цепи фаза-нуль",
+        "электролаборатория",
+        "испытания электроизолирующих перчаток",
+        "сопротивления растеканию тока",
+        # === v7.2.8: Испытания пожарных систем (НЕ НАШ ПРОФИЛЬ) ===
+        "гидравлическое испытание",
+        "испытание пожарных кранов",
+        "испытание пожарных гидрантов",
+        "перекатка пожарных рукавов",
+        "проверка пожарных кранов",
+        "испытание сети внутреннего противопожарного водопровода",
+        # === v7.2.8: Проектирование и стройка (НЕ НАШ ПРОФИЛЬ) ===
+        "проектной документации",
+        "строительно-монтажных",
+        "реконструкции",
+        "котлоагрегата",
     ]
+
 
 def _load_context_exceptions() -> List[str]:
     """Контекстные исключения для фильтров."""
@@ -84,30 +119,48 @@ SEARCH_CONFIG = {
     "okpd2_ids": ["8874806", "8879198", "8879202"],
     "okpd2_codes": ["85.42", "71.20.11", "71.20.19"],
     "relevance_keywords": [
+        # --- ОБУЧЕНИЕ ОТ ---
         "охрана труда",
         "охране труда",
         "охраны труда",
+        "обучение по охране труда",
+        "проверка знаний требований охраны труда",
+        "безопасные методы и приемы выполнения работ",
+        "обучение безопасным методам",
+        "первая помощь пострадавшим",
+        # --- СОУТ ---
         "СОУТ",
+        "соут",
         "специальная оценка условий труда",
         "специальной оценки условий труда",
         "специальной оценке условий труда",
+        "спецоценка",
+        "оценка рабочих мест",
+        # --- ОПР ---
         "оценка профессиональных рисков",
         "оценке профессиональных рисков",
         "оценки профессиональных рисков",
+        "оценка проф. рисков",
+        "опр",
+        "идентификация опасностей",
+        # --- ПЛК ---
         "производственный лабораторный контроль",
         "производственного лабораторного контроля",
+        "плк",
+        "лабораторные исследования",
+        "санитарно-гигиенические исследования",
         "замеры вредных факторов",
         "замеров вредных факторов",
+        "замеры шума",
+        "инструментальный контроль",
         "вредные производственные факторы",
         "вредных производственных факторов",
-        "обучение охране труда",
-        "обучению охране труда",
-        "обучения охране труда",
-        "оценка проф. рисков",
+        # --- ПОЖАРНАЯ / ПРОМЫШЛЕННАЯ БЕЗОПАСНОСТЬ (только обучение) ---
         "пожарная безопасность",
         "пожарной безопасности",
         "промышленная безопасность",
         "промышленной безопасности",
+        # --- ПРОЧЕЕ ---
         "обучение рабочих профессий",
         "технологические карты",
         "санитарно-защитная зона",
@@ -115,6 +168,12 @@ SEARCH_CONFIG = {
         "инструктажи",
         "аттестация рабочих мест",
         "аттестации рабочих мест",
+        # === v7.2.8: Производственный контроль (ПЛК) ===
+        "производственный контроль",
+        "производственного контроля",
+        "санитарных правил",
+        "санитарно-противоэпидемических",
+        "санитарно-эпидемиологических",
     ],
     "exclude_keywords": _load_exclude_keywords(),
     "exclude_context_exceptions": _load_context_exceptions(),
@@ -179,10 +238,6 @@ class TenderSearcher:
             return self.session
         return self._sessions[index % len(self._sessions)]
 
-    # ========== v6.8.6: УБРАНО ДУБЛИРОВАНИЕ ==========
-    # _rotate_user_agent, _calculate_delay, _handle_429, _reset_429_counter, _make_request
-    # → ВСЁ делегируется session_manager.make_request()
-
     def search(
         self,
         max_pages: Optional[int] = None,
@@ -196,9 +251,9 @@ class TenderSearcher:
         logger.info(f"\n{'='*60}")
         logger.info(f"📋 Поиск тендеров")
         logger.info(f"📋 Фильтр НМЦК: ≥{self.config.get('min_nmck', 100000):,}₽")
-        logger.info(f"📋 Период: {self.config.get('publish_date_days', 14)} дней")
+        logger.info(f" Период: {self.config.get('publish_date_days', 14)} дней")
         logger.info(f"📋 Законы: {self.config.get('laws', [])}")
-        logger.info(f"📋 ОКПД2: {self.config.get('okpd2_codes', [])}")
+        logger.info(f" ОКПД2: {self.config.get('okpd2_codes', [])}")
         logger.info(
             f"📋 Мин. дней до дедлайна: {self.config.get('min_days_to_deadline', 3)}"
         )
@@ -224,7 +279,7 @@ class TenderSearcher:
             passed, days_left = self.filters.check_deadline(result.deadline_date)
             if not passed:
                 logger.info(
-                    f"  ⏭ {result.tender_id}: до дедлайна {days_left} дней — пропущен"
+                    f"   {result.tender_id}: до дедлайна {days_left} дней — пропущен"
                 )
                 continue
 
@@ -248,18 +303,16 @@ class TenderSearcher:
         max_pages: Optional[int] = None,
     ) -> Generator[TenderSearchResult, None, None]:
         """Выполняет поиск по страницам."""
-        # Временный fallback — создаём SearchUrlBuilder
         url = self.url_builder.build_search_url(
             page=1,
             okpd2_ids=self.config.get("okpd2_ids"),
             min_nmck=self.config.get("min_nmck"),
             publish_date_days=self.config.get("publish_date_days", 3),
         )
-        # v6.8.6: Используем session_manager.make_request()
         response = self.session_manager.make_request(url)
 
         if not response:
-            logger.error("❌ Не удалось загрузить первую страницу")
+            logger.error(" Не удалось загрузить первую страницу")
             return
 
         if "captcha" in response.text.lower():
@@ -272,7 +325,7 @@ class TenderSearcher:
             return
 
         total_pages = min((total_count // 50) + 1, max_pages or 100)
-        logger.info(f"📊 ~{total_count} записей, страниц: {total_pages}")
+        logger.info(f" ~{total_count} записей, страниц: {total_pages}")
 
         for result in self.parser.parse_search_page(response.text):
             yield result
@@ -322,7 +375,6 @@ class TenderSearcher:
         time.sleep(random.uniform(0.1, 0.3))
 
         try:
-            # v6.8.6: Используем session_manager.make_request() для единой retry-логики
             response = self.session_manager.make_request(
                 url, session_index=page % len(self._sessions), timeout=30, max_retries=2
             )
@@ -335,7 +387,7 @@ class TenderSearcher:
             if response:
                 logger.warning(f"  ⚠️ Страница {page}: статус {response.status_code}")
             else:
-                logger.warning(f"  ⚠️ Страница {page}: нет ответа после ретраев")
+                logger.warning(f"  ️ Страница {page}: нет ответа после ретраев")
             return None
 
         except Exception as e:
@@ -350,14 +402,14 @@ class TenderSearcher:
     ) -> List[Dict]:
         """Поиск с сохранением результатов."""
         logger.info(f"\n{'='*60}")
-        logger.info(f"📋 Фильтр НМЦК: ≥{self.config.get('min_nmck', 100000):,}₽")
+        logger.info(f" Фильтр НМЦК: ≥{self.config.get('min_nmck', 100000):,}₽")
         logger.info(f"📋 Период: {self.config.get('publish_date_days', 14)} дней")
         logger.info(f"📋 Законы: {self.config.get('laws', [])}")
         logger.info(f"📋 ОКПД2: {self.config.get('okpd2_codes', [])}")
         logger.info(
             f"📋 Мин. дней до дедлайна: {self.config.get('min_days_to_deadline', 3)}"
         )
-        logger.info(f"📋 Сортировка: по дедлайну (ближайшие первые)")
+        logger.info(f" Сортировка: по дедлайну (ближайшие первые)")
         logger.info(f"{'='*60}")
 
         results = []
@@ -374,11 +426,11 @@ class TenderSearcher:
                 if tender.nmck
                 else "💰 НМЦК: не указана"
             )
-            print(f"🏢 Заказчик: {tender.customer or 'не указан'}")
+            print(f" Заказчик: {tender.customer or 'не указан'}")
             print(f"📅 Размещено: {tender.publish_date or 'не указана'}")
             print(f"⏰ Срок: {tender.deadline_date or 'не указан'}")
             print(f"⚖️ Закон: {tender.law}")
-            print(f"📋 Статус: {tender.status or 'не указан'}")
+            print(f" Статус: {tender.status or 'не указан'}")
             print(f"🔗 {tender.url}")
             print(f"🗺️ Регион: {tender.region or 'не определён'}")
             print(f"{'-'*60}")

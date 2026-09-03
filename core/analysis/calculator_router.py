@@ -10,6 +10,9 @@ core/analysis/calculator_router.py
 
 ИСПРАВЛЕНО (v7.1.0):
 - testing маршрутизируется на PLK-калькулятор (ближайший аналог)
+
+ИСПРАВЛЕНО (v7.2.9):
+- Защита от ложного ОПР для электролаборатории.
 """
 
 from typing import Dict, Any
@@ -26,7 +29,7 @@ class CalculatorRouter:
     Делегирует вычисления TenderCalculator в зависимости от типа.
     """
 
-    VERSION = "v7.1.0"
+    VERSION = "v7.2.9"
 
     def __init__(self, calculator: TenderCalculator):
         self.calculator = calculator
@@ -50,9 +53,8 @@ class CalculatorRouter:
         elif tender_type == "education":
             return self._calc_education(tender_info, documents_text)
         elif tender_type == "opr":
-            return self._calc_opr(tender_info)
+            return self._calc_opr(tender_info, documents_text)
         elif tender_type in ("plk", "testing"):
-            # v7.1.0: testing использует PLK-калькулятор как ближайший аналог
             if tender_type == "testing":
                 logger.info(
                     f"[{self.VERSION}] Testing → маршрутизация на PLK-калькулятор"
@@ -71,7 +73,6 @@ class CalculatorRouter:
         if not rm_total:
             return self._manual_review("Не определено количество РМ")
 
-        # v7.2.5: Передаем region для расчета средних билетов
         region = info.get("region", "") or info.get("customer_region", "")
 
         return self.calculator.calculate_sout(
@@ -85,7 +86,7 @@ class CalculatorRouter:
             is_seasonal=info.get("is_seasonal", False),
             is_annual=info.get("is_annual", False),
             transport_cost=info.get("transport_cost", 0),
-            region=region, 
+            region=region,
         )
 
     # ==================== Обучение ====================
@@ -125,7 +126,6 @@ class CalculatorRouter:
     def _detect_education_docs(self, info: Dict[str, Any], text: str) -> Dict[str, int]:
         """
         Определяет типы документов для обучения.
-
         Ключевое правило: обучение ОТ -> всегда protocols_count = students_count.
         """
         text_lower = text.lower()
@@ -155,19 +155,50 @@ class CalculatorRouter:
 
     # ==================== ОПР ====================
 
-    def _calc_opr(self, info: Dict[str, Any]) -> CalculationResult:
+    def _calc_opr(
+        self, info: Dict[str, Any], documents_text: str = ""
+    ) -> CalculationResult:
         """Расчёт ОПР."""
         positions = info.get("opr_positions", 0)
         persons = info.get("opr_persons", 0)
 
-        if not positions and not persons:
-            if info.get("rm_total"):
-                positions = info["rm_total"]
-                logger.info(
-                    f"[{self.VERSION}] ОПР: используем rm_total={positions} как opr_positions"
-                )
-            else:
-                return self._manual_review("Не определено количество должностей ОПР")
+        # v7.2.9: Защита от ложного ОПР (Электролаборатория)
+        if documents_text and any(
+            kw in documents_text.lower()
+            for kw in [
+                "замеров сопротивления изоляции",
+                "измерения заземления",
+                "сопротивления цепи фаза-нуль",
+                "электролаборатория",
+                "испытания электроизолирующих перчаток",
+                "сопротивления растеканию тока",
+            ]
+        ):
+            logger.warning(
+                f"[{self.VERSION}] Обнаружены признаки электролаборатории в тендере ОПР. "
+                f"Перенаправляю на ручную проверку."
+            )
+            return self._manual_review(
+                "Вероятно, это электролаборатория (ЭТЛ), а не ОПР. Требуется ручной расчет или черный список."
+            )
+
+        # v7.2.8: Защита от ложного ОПР (Испытания пожарных систем)
+        if documents_text and any(
+            kw in documents_text.lower()
+            for kw in [
+                "гидравлическое испытание",
+                "испытание пожарных кранов",
+                "испытание пожарных гидрантов",
+                "перекатка пожарных рукавов",
+            ]
+        ):
+            logger.warning(
+                f"[{self.VERSION}] Обнаружены признаки испытаний пожарных систем в тендере ОПР. "
+                f"Перенаправляю на ручную проверку."
+            )
+            return self._manual_review(
+                "Вероятно, это испытания пожарных систем, а не ОПР. Требуется ручной расчет."
+            )
 
         return self.calculator.calculate_opr(
             rm_count=info.get("rm_total", 0),

@@ -4,6 +4,8 @@ core/calculation/sout_calculator.py
 Вынесено из calculator.py (v6.5).
 ИСПРАВЛЕНО (v6.7.3):
   - Убран дублирующийся CalculationResult (импорт из calculation_result.py)
+ИСПРАВЛЕНО (v7.2.9):
+  - Устранено дублирование транспорта: если есть билеты, бензин не считается.
 """
 
 from typing import Literal
@@ -43,6 +45,7 @@ class SoutCalculator:
         Расчёт цены для клиента на СОУТ.
         v6.4.2: trips = regions_count, унифицированные командировочные.
         v6.9.1: Годовые тендеры — основной расчёт, материалы, доставка ×12
+        v7.2.9: Фикс дубля транспорта (бензин vs билеты).
         """
         # v6.9.1: Годовой множитель
         annual_mult = 12 if is_annual else 1
@@ -53,10 +56,10 @@ class SoutCalculator:
         )
 
         # === Основной расчёт (v7.2.5: исправлен вызов) ===
-        # Убираем rm_cat_1, rm_cat_2, variant из вызова, так как метод упрощен до 213*rm
-        # Но сам метод _calc_main_price оставим с аргументами для совместимости, просто не будем их использовать
         price = (
-            self._calc_main_price(rm_total, rm_category_1, rm_category_2, rm_with_iii, variant) 
+            self._calc_main_price(
+                rm_total, rm_category_1, rm_category_2, rm_with_iii, variant
+            )
             * annual_mult
         )
 
@@ -68,12 +71,25 @@ class SoutCalculator:
             is_urgent=(trip_days <= 5 if trip_days else False),
         )
 
-        # === Командировочные (v7.2.5: добавлен расчет билетов) ===
+        # === Командировочные (v7.2.9: фикс дубля транспорта) ===
         travel_cost_auto, measurer_and_daily, accommodation_cost_auto, flight_cost = (
             self._calc_travel(
-                trip_days, regions_count, transport_cost, is_seasonal, cities_count, region # <-- ПЕРЕДАТЬ REGION
+                trip_days,
+                regions_count,
+                transport_cost,
+                is_seasonal,
+                cities_count,
+                region,
             )
         )
+
+        # v7.2.9: Если рассчитаны билеты, обнуляем "бензин/выезд", чтобы не было дубля
+        if flight_cost > 0 and travel_cost_auto > 0:
+            logger.info(
+                f"[SoutCalc v7.2.9] Обнаружены билеты ({flight_cost}₽). "
+                f"Обнуляю 'бензин/выезд' ({travel_cost_auto}₽) во избежание дубля."
+            )
+            travel_cost_auto = 0
 
         if is_annual:
             travel_cost_auto *= annual_mult
@@ -89,7 +105,7 @@ class SoutCalculator:
             + travel_cost_auto
             + measurer_and_daily
             + accommodation_cost_auto
-            + flight_cost # <-- УЖЕ БЫЛО, НО ТЕПЕРЬ flight_cost НЕ 0
+            + flight_cost
             + subcontractor_cost
         )
 
@@ -181,7 +197,9 @@ class SoutCalculator:
             * self.costs["materials"]["ink_per_page"]["default_quantity"]
         )
 
-    def _calc_delivery(self, delivery_count: int, is_annual: bool, is_urgent: bool = False) -> float:
+    def _calc_delivery(
+        self, delivery_count: int, is_annual: bool, is_urgent: bool = False
+    ) -> float:
         actual_delivery = 12 if is_annual else delivery_count
         base_cost = self.costs["delivery"]["post_russia"]["cost"]
         if is_urgent:
@@ -195,7 +213,7 @@ class SoutCalculator:
         transport_cost: float,
         is_seasonal: bool,
         cities_count: int,
-        region: str = "",  # <-- ДОБАВИТЬ ПАРАМЕТР
+        region: str = "",
     ) -> tuple:
         """Расчёт командировочных. Возвращает (travel_auto, measurer_daily, accommodation, flight)."""
         seasonal_mult = self.travel.get("seasonal_multiplier", 2) if is_seasonal else 1
@@ -212,13 +230,12 @@ class SoutCalculator:
         )
 
         # v7.2.5: РАСЧЁТ БИЛЕТОВ (Средняя заглушка)
-        # Если транспорт не указан явно (transport_cost=0) и регион не офисный (Екб), закладываем среднюю цену
         office_cities = [
             "екатеринбург",
             "верхняя пышма",
             "березовский",
             "арти",
-        ]  # можно расширить
+        ]
         is_office = (
             any(city in region.lower() for city in office_cities) if region else False
         )
@@ -227,7 +244,6 @@ class SoutCalculator:
         if transport_cost > 0:
             flight_cost = transport_cost
         elif not is_office and trips > 0:
-            # Средняя цена плацкарта/самолета туда-обратно ~8000₽
             avg_ticket_price = 8000
             flight_cost = avg_ticket_price * trips * seasonal_mult
             logger.info(

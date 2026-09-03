@@ -28,20 +28,19 @@ try:
     # Убираем дефолтный хендлер loguru чтобы не было дублей
     logger.remove()
 
-    # Файловый лог
-    logger.add(
-        LOG_DIR / "tender_bot.log",
-        rotation="10 MB",
-        retention="30 days",
-        level="DEBUG",
-        format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} | {message}",
-    )
-
-    # Консольный лог (без дублей)
+    # Консольный лог (теперь показывает INFO)
     logger.add(
         sys.stdout,
-        level="INFO",
+        level="INFO",  # <-- БЫЛО WARNING, СТАЛО INFO
         format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | {message}",
+    )
+    
+    # Но при этом оставляем INFO для главного файла, чтобы видеть начало тендера
+    logger.add(
+        sys.stdout,
+        level="DEBUG",
+        format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | {message}",
+        filter=lambda record: record["name"] == "__main__"
     )
 except ImportError:
     import logging

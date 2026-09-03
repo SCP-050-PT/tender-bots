@@ -5,8 +5,13 @@ core/calculation/education_calculator.py
 ИСПРАВЛЕНО (v6.9.0):
   - Аренда помещения = 0 в офисных городах (Екатеринбург, Ижевск, Тюмень, Новосибирск)
   - Добавлен параметр region
+ИСПРАВЛЕНО (v7.2.8-v7.2.9):
+  - Авто-дистант для всех типов обучения.
+  - Fallback поиска количества слушателей в тексте ТЗ.
+  - Уточнение типа документов для пожарки (удостоверение vs диплом).
 """
 
+import re
 from dataclasses import dataclass
 from typing import Optional
 from loguru import logger
@@ -59,10 +64,41 @@ class EducationCalculator:
         Расчёт цены для клиента на обучение.
         v6.9.0: Аренда = 0 в офисных городах.
         v6.9.1: Годовые тендеры — документы, материалы, труд, доставка ×12
+        v7.2.9: Fallback количества слушателей и уточнение документов пожарки.
         """
 
         # v6.9.1: Годовой множитель
         annual_mult = 12 if is_annual else 1
+
+        # === v7.2.9: FALLBACK ПОИСКА КОЛИЧЕСТВА СЛУШАТЕЛЕЙ В ТЕКСТЕ ===
+        if students_count == 0 and tender_text:
+            patterns = [
+                r"(\d+)\s*(?:человек|чел\.|обучающихся|слушателей|работников)",
+                r"(?:количество|кол-во)\s*(?:обучающихся|слушателей)?\s*[:\-]\s*(\d+)",
+            ]
+
+            found_counts = []
+            text_lower_search = tender_text.lower()
+            for pattern in patterns:
+                matches = re.findall(pattern, text_lower_search)
+                if matches:
+                    for m in matches:
+                        val_str = m[0] if isinstance(m, tuple) else m
+                        try:
+                            val = int(val_str)
+                            if 1 < val < 1000:
+                                found_counts.append(val)
+                        except ValueError:
+                            continue
+
+            if found_counts:
+                students_count = sum(found_counts)
+                logger.info(
+                    f"[EducationCalc v7.2.9] Fallback: найдено кол-во слушателей в тексте: "
+                    f"{found_counts} → итого students_count={students_count}"
+                )
+        # ==========================================================
+
         # === Guard для обучения ОТ ===
         if students_count > 0 and tender_text:
             text_lower = tender_text.lower()
@@ -109,6 +145,12 @@ class EducationCalculator:
 
             if tender_text:
                 text_lower = tender_text.lower()
+
+                # Проверка на удостоверение для пожарки (v7.2.9)
+                has_certificate_kw = (
+                    "удостоверение" in text_lower or "удостоверения" in text_lower
+                )
+
                 if any(
                     kw in text_lower
                     for kw in [
@@ -138,35 +180,57 @@ class EducationCalculator:
                     )
 
                     # v7.2.4: ПРИНУДИТЕЛЬНЫЙ ДИСТАНТ ДЛЯ ОТ
-                    # Если в ТЗ есть "дистанц" или нет слов "очно/полигон" -> это дистант
-                    # Источник: "расчет_цен_для_участия_в_тендерах.docx" п.1.3
-                    has_distance_kw = any(kw in text_lower for kw in [
-                        "дистанц", "электронн", "онлайн", "distance", "remote"
-                    ])
-                    has_onsite_kw = any(kw in text_lower for kw in [
-                        "очно", "очная форма", "полигон", "выездное обучение", 
-                        "практическое занятие", "тренировочный полигон"
-                    ])
+                    has_distance_kw = any(
+                        kw in text_lower
+                        for kw in [
+                            "дистанц",
+                            "электронн",
+                            "онлайн",
+                            "distance",
+                            "remote",
+                        ]
+                    )
+                    has_onsite_kw = any(
+                        kw in text_lower
+                        for kw in [
+                            "очно",
+                            "очная форма",
+                            "полигон",
+                            "выездное обучение",
+                            "практическое занятие",
+                            "тренировочный полигон",
+                        ]
+                    )
 
-                    # Если явно указан дистант ИЛИ не указана очка -> считаем дистантом
                     if has_distance_kw or not has_onsite_kw:
                         is_distance = True
                         logger.info(
                             f"[EducationCalc v7.2.4] Авто: ОТ без 'очно' → "
                             f"is_distance=True (принудительный дистант)"
                         )
+
                 elif any(
                     kw in text_lower
                     for kw in [
                         "переподготовка",
                         "профпереподготовка",
                         "профессиональная переподготовка",
+                        "пожарная безопасность",
+                        "пожарной безопасности",
                     ]
                 ):
-                    diplomas = students_count
-                    logger.info(
-                        f"[EducationCalc] Авто: переподготовка → diplomas={students_count}"
-                    )
+                    # v7.2.9: Если есть слово "удостоверение", ставим сертификаты, иначе дипломы
+                    if has_certificate_kw:
+                        certificates = students_count
+                        logger.info(
+                            f"[EducationCalc v7.2.9] Авто: пожарка/переподготовка + 'удостоверение' → certificates={students_count}"
+                        )
+                    else:
+                        diplomas = students_count
+                        logger.info(
+                            f"[EducationCalc] Авто: переподготовка/пожарка → diplomas={students_count}"
+                        )
+
                 elif any(
                     kw in text_lower
                     for kw in ["повышение квалификации", "квалификация"]
@@ -184,6 +248,50 @@ class EducationCalculator:
                 protocols_count = students_count
                 logger.info(
                     f"[EducationCalc] Авто: нет текста → protocols_count={students_count}"
+                )
+
+        # === v7.2.8: АВТО-ДИСТАНТ ДЛЯ ВСЕХ ТИПОВ ОБУЧЕНИЯ ===
+        if not is_distance and tender_text:
+            text_lower = tender_text.lower()
+
+            has_distance_kw = any(
+                kw in text_lower
+                for kw in [
+                    "заочная",
+                    "заочной",
+                    "заочное",
+                    "дистанц",
+                    "электронн",
+                    "онлайн",
+                    "distance",
+                    "remote",
+                    "рабочее место обучающегося",
+                ]
+            )
+
+            has_onsite_kw = any(
+                kw in text_lower
+                for kw in [
+                    "очно",
+                    "очная форма",
+                    "полигон",
+                    "выездное обучение",
+                    "практическое занятие",
+                    "тренировочный полигон",
+                    "аудиторные занятия",
+                ]
+            )
+
+            if has_distance_kw and not has_onsite_kw:
+                is_distance = True
+                logger.info(
+                    f"[EducationCalc v7.2.8] Авто: обнаружены маркеры дистанта → "
+                    f"is_distance=True (текст: {'заочная' if 'заочная' in text_lower else 'дистанц/электрон'})"
+                )
+            elif has_distance_kw and has_onsite_kw:
+                logger.warning(
+                    f"[EducationCalc v7.2.8] Обнаружена смешанная форма (очно+дистант). "
+                    f"Оставляем is_distance=False для безопасности."
                 )
 
         logger.info(
@@ -225,24 +333,16 @@ class EducationCalculator:
         overhead_cost = self.overhead["base"]["cost"] * annual_mult
 
         # === Трудозатраты (v7.2.3: по калькулятору Александры) ===
-        # Нагрузка тендерного специалиста (все типы) — из "для бота тенедры.docx"
-        specialist_cost = 3 * 100 * annual_mult  # 3ч × 100₽ = 300₽
-
-        # Часы методиста (только обучение) — из Калькулятор тендеры.xlsx
-        # "В формуле учитывается 3 часа работы методиста и РО"
+        specialist_cost = 3 * 100 * annual_mult
         methodist_hours = 3
-        methodist_rate = self.labor["methodist_hour"]["cost"]  # 227₽
-        methodist_cost = methodist_hours * methodist_rate * annual_mult  # 681₽
+        methodist_rate = self.labor["methodist_hour"]["cost"]
+        methodist_cost = methodist_hours * methodist_rate * annual_mult
 
-        # Часы РО (только обучение) — из Калькулятор тендеры.xlsx
         ro_hours = 3
-        ro_rate = self.labor["ro_hour"]["cost"]  # 600₽
-        ro_cost = ro_hours * ro_rate * annual_mult  # 1800₽
+        ro_rate = self.labor["ro_hour"]["cost"]
+        ro_cost = ro_hours * ro_rate * annual_mult
 
-        # Портал — за каждого слушателя
-        portal_cost = (
-            self.labor["portal_access"]["cost"] * students_count * annual_mult
-        )  # 57₽ × N
+        portal_cost = self.labor["portal_access"]["cost"] * students_count * annual_mult
 
         labor_cost = specialist_cost + methodist_cost + ro_cost + portal_cost
 
