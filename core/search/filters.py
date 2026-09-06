@@ -1,6 +1,7 @@
 """
 Фильтры для результатов поиска тендеров.
 Вынесено из searcher.py (v6.6-r2).
+ИСПРАВЛЕНО (v7.4.1): Добавлена очистка от неразрывных пробелов ЕИС (\xa0)
 """
 
 import re
@@ -17,17 +18,44 @@ class TenderFilters:
         self._exclude_keywords = self.config.get("exclude_keywords", [])
         self._relevance_keywords = self.config.get("relevance_keywords", [])
         self._exclude_composite = self.config.get("exclude_composite", [])
-        self._exclude_context_exceptions = self.config.get("exclude_context_exceptions", [])
+        self._exclude_context_exceptions = self.config.get(
+            "exclude_context_exceptions", []
+        )
         self._min_days_to_deadline = self.config.get("min_days_to_deadline", 3)
+
+        # Лог загрузки ключевых слов при инициализации
+        logger.info(
+            f"[TenderFilters] Загружено {len(self._relevance_keywords)} ключей релевантности"
+        )
 
     def is_relevant(self, title: str) -> bool:
         """Проверяет релевантность по ключевым словам."""
         if not title:
+            logger.debug(f"[FILTER] Пустой заголовок → не релевантно")
             return False
-        text_lower = title.lower()
-        for keyword in self._relevance_keywords:
-            if keyword.lower() in text_lower:
-                return True
+            
+        # Очистка от спецсимволов ЕИС
+        text_lower = title.lower().replace("\xa0", " ").strip()
+        
+        # Временная диагностика: проверяем каждое ключевое слово
+        keywords = self._relevance_keywords
+        found_matches = []
+        
+        for keyword in keywords:
+            kw_lower = keyword.lower()
+            if kw_lower in text_lower:
+                found_matches.append(kw_lower)
+                
+        if found_matches:
+            logger.debug(f"[FILTER] ✅ РЕЛЕВАНТНО ('{title[:50]}...'). Найдены ключи: {found_matches[:3]}")
+            return True
+            
+        # Логируем ПОЧЕМУ не прошло, если ничего не найдено
+        logger.debug(
+            f"[FILTER] ❌ НЕ РЕЛЕВАНТНО ('{title[:60]}...'). "
+            f"Проверено {len(keywords)} ключей. "
+            f"Очищенный текст: '{text_lower[:80]}...'"
+        )
         return False
 
     def has_excluded_keywords(self, title: str) -> bool:
@@ -35,7 +63,8 @@ class TenderFilters:
         if not title:
             return False
 
-        text_lower = title.lower()
+        # Также чистим заголовок для проверки исключений
+        text_lower = title.lower().replace("\xa0", " ")
 
         # Контекстные исключения (СОУТ/ОПР)
         has_sout_context = any(
@@ -47,7 +76,9 @@ class TenderFilters:
             keyword_lower = keyword.lower()
             if keyword_lower in text_lower:
                 if has_sout_context and "информационная безопасность" in keyword_lower:
-                    logger.info(f"  [Filters] Пропущено '{keyword}' (контекст СОУТ/ОПР)")
+                    logger.info(
+                        f"  [Filters] Пропущено '{keyword}' (контекст СОУТ/ОПР)"
+                    )
                     continue
                 logger.debug(f"  [Filters] Найдено запрещённое: '{keyword}'")
                 return True
@@ -56,7 +87,9 @@ class TenderFilters:
         for composite in self._exclude_composite:
             if self._check_composite(text_lower, composite):
                 if has_sout_context and composite.get("check_context", False):
-                    logger.info(f"  [Filters] Пропущена составная фраза (контекст СОУТ/ОПР)")
+                    logger.info(
+                        f"  [Filters] Пропущена составная фраза (контекст СОУТ/ОПР)"
+                    )
                     continue
                 logger.debug(f"  [Filters] Составная фраза: {composite['words']}")
                 return True
@@ -150,5 +183,6 @@ class TenderFilters:
         """Сортирует результаты по дедлайну (ближайшие первые)."""
         return sorted(
             results,
-            key=lambda x: self._parse_deadline(getattr(x, "deadline_date", None)) or datetime.max
+            key=lambda x: self._parse_deadline(getattr(x, "deadline_date", None))
+            or datetime.max,
         )

@@ -6,7 +6,7 @@ core/analysis/__init__.py
 from core.analysis.analyzer import TenderAnalyzer
 from core.analysis.result import AnalysisResult
 from core.analysis.guard_engine import GuardEngine
-from core.analysis.calculator_router import CalculatorRouter
+from core.calculation.calculator_router import CalculatorRouter
 
 __all__ = [
     "TenderAnalyzer",

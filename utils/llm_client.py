@@ -86,13 +86,12 @@ class YandexGPTClient:
                     # Параметры температуры и токенов берутся из настроек агента в AI Studio
                 )
 
-                
                 text = response.output_text
                 logger.info(f" ПОЛНЫЙ ОТВЕТ АГЕНТА:\n{text[:1000]}...")
 
                 if text:
                     parsed = self._extract_json(text)
-                    
+
                     # === ПРОВЕРКА НА БЛОКИРОВКУ ОТ АГЕНТА ===
                     if parsed and parsed.get("decision") == "не рекомендуется":
                         logger.warning(f"🛑 АГЕНТ ЗАБЛОКИРОВАЛ ТЕНДЕР: {parsed.get('reason')}")
@@ -103,12 +102,19 @@ class YandexGPTClient:
                             "blocked_by_agent": True
                         }
                     # ==========================================
-                    
+                    # === НОВОЕ: Маркировка ненадежных данных ===
+                    if parsed and parsed.get("confidence", 0) < 0.5:
+                        logger.warning(
+                            f"⚠️ Низкая уверенность агента ({parsed.get('confidence')}). Помечаю для fallback."
+                        )
+                        parsed["llm_unreliable"] = True
+
                     if parsed:
                         logger.info("Ответ получен от АГЕНТ, извлекаю JSON...")
                         return parsed
                     else:
                         return {"raw_text": text, "parse_error": True}
+
                 else:
                     logger.error("Пустой ответ от агента")
                     return None

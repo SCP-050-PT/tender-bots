@@ -160,7 +160,7 @@ class TenderTypeDetector:
         for ttype, keywords in self.TYPE_KEYWORDS.items():
             score = 0
             for keyword, weight in keywords:
-                count = text_lower.count(keyword.lower())
+                count = self._count_keyword_safe(text, keyword)
                 if count > 0:
                     score += count * weight
                     matched_keywords.append((ttype, keyword, weight, count))
@@ -378,6 +378,20 @@ class TenderTypeDetector:
             return False, "Тип 'соут', но количество РМ не найдено в тексте"
 
         return True, ""
+    
+    def _count_keyword_safe(self, text: str, keyword: str) -> int:
+        """Безопасный подсчет ключевых слов с учетом границ."""
+        text_lower = text.lower()
+        kw_lower = keyword.lower()
+        
+        # Для коротких аббревиатур (опр, плк, соут) ищем как отдельные слова
+        if len(kw_lower) <= 4:
+            # Используем regex с границами слов \b
+            pattern = r'\b' + re.escape(kw_lower) + r'\b'
+            return len(re.findall(pattern, text_lower))
+        else:
+            # Для длинных фраз обычный count безопасен
+            return text_lower.count(kw_lower)
 
 
 _type_detector: Optional[TenderTypeDetector] = None
@@ -388,3 +402,4 @@ def get_type_detector() -> TenderTypeDetector:
     if _type_detector is None:
         _type_detector = TenderTypeDetector()
     return _type_detector
+

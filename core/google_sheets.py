@@ -330,6 +330,14 @@ class GoogleSheetsManager:
             logger.error(f"Ошибка: {e}")
             return 1
 
+    def check_exists(self, tender_id: str) -> bool:
+        """Быстрая проверка наличия тендера в таблице."""
+        try:
+            # Ищем только в колонке A (ID тендера)
+            cell = self.worksheet.find(str(tender_id), in_column=1)
+            return cell is not None
+        except Exception:
+            return False
 _sheets_manager: Optional[GoogleSheetsManager] = None
 
 

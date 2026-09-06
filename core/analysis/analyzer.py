@@ -1,8 +1,11 @@
 """
 core/analysis/analyzer.py
 Фасад для анализа тендеров.
-v7.0.0: Рефакторинг — делегирование сервисам TypeService, LlmService, FallbackService.
-Убраны дубли: _build_extraction_prompt, _parse_json, FALLBACK-блоки.
+
+v7.5.0:
+  - P0-3: Приоритет КТРУ над hint'ом парсера (students_count > 0 → education)
+  - P1-4: Сохранение fallback-значений в tender_info для передачи в details
+  - Рефакторинг — делегирование сервисам TypeService, LlmService, FallbackService
 """
 
 import json
@@ -17,7 +20,7 @@ from utils.llm_client import YandexGPTClient
 from core.calculation.calculation_result import CalculationResult
 from core.analysis.result import AnalysisResult
 from core.analysis.guard_engine import GuardEngine
-from core.analysis.calculator_router import CalculatorRouter
+from core.calculation.calculator_router import CalculatorRouter
 
 # v7.0.0: Единые сервисы вместо дублей
 from core.services.type_service import TypeService
@@ -26,9 +29,9 @@ from core.services.fallback_service import FallbackService
 
 
 class TenderAnalyzer:
-    """Фасад для анализа тендеров. v7.0.0: оркестрация через сервисы."""
+    """Фасад для анализа тендеров. v7.5.0: приоритет КТРУ + сохранение fallback."""
 
-    VERSION = "v7.0.0"
+    VERSION = "v7.5.0"
 
     # Mapping ЭТП → комиссия (%)
     ETP_COMMISSION_RATES = {
@@ -71,6 +74,18 @@ class TenderAnalyzer:
         """Анализирует тендер полностью."""
         logger.info(f"[{self.VERSION}] Начинаю анализ тендера")
 
+        # === P0-3: ПРИОРИТЕТ КТРУ НАД HINT'ОМ ПАРСЕРА ===
+        # Если КТРУ дал students_count > 0 → это ТОЧНО education,
+        # даже если парсер определил sout/opr/plk
+        if tender_info.get("students_count", 0) > 0:
+            if tender_type_hint and tender_type_hint != "education":
+                logger.warning(
+                    f"[{self.VERSION}] Override типа: {tender_type_hint} → education "
+                    f"(КТРУ дал {tender_info['students_count']} слушателей)"
+                )
+                tender_type_hint = "education"
+        # ==========================================
+
         # Шаг 1: Определение типа (через TypeService)
         tender_type, type_source, method = self.type_service.resolve(
             tender_info=tender_info,
@@ -89,8 +104,55 @@ class TenderAnalyzer:
         # Шаг 3.5: Fallback-оценки по НМЦК (через FallbackService)
         self.fallback_service.apply(tender_info, tender_type)
 
-        # Шаг 4: Глобальные затраты (ЭТП, обеспечение, специалист, срочность)
+        # === P1-4: СОХРАНЕНИЕ FALLBACK В TENDER_INFO ДЛЯ DETAILS ===
+        # FallbackService применяет значения локально, но не сохраняет их
+        # в tender_info с пометкой источника. Делаем это явно здесь,
+        # чтобы _get_quantity() в main.py мог найти их.
         nmck = tender_info.get("nmck", 0)
+        if nmck > 0:
+            if tender_type == "sout" and not tender_info.get("rm_total"):
+                estimated = int(nmck / 1200)
+                tender_info["rm_total"] = estimated
+                tender_info["rm_total_source"] = "fallback_nmck"
+                logger.info(
+                    f"[{self.VERSION}] Fallback СОУТ: {estimated} РМ → сохранено в tender_info"
+                )
+
+            elif (
+                tender_type == "plk"
+                and not tender_info.get("measurement_points")
+                and not tender_info.get("points_count")
+            ):
+                estimated = int(nmck / 500)
+                tender_info["measurement_points"] = estimated
+                tender_info["points_count"] = estimated
+                tender_info["points_source"] = "fallback_nmck"
+                logger.info(
+                    f"[{self.VERSION}] Fallback ПЛК: {estimated} точек → сохранено в tender_info"
+                )
+
+            elif (
+                tender_type == "opr"
+                and not tender_info.get("opr_positions")
+                and not tender_info.get("opr_persons")
+            ):
+                estimated = int(nmck / 700)
+                tender_info["opr_positions"] = estimated
+                tender_info["opr_positions_source"] = "fallback_nmck"
+                logger.info(
+                    f"[{self.VERSION}] Fallback ОПР: {estimated} позиций → сохранено в tender_info"
+                )
+
+            elif tender_type == "education" and not tender_info.get("students_count"):
+                estimated = int(nmck / 1500)
+                tender_info["students_count"] = estimated
+                tender_info["students_count_source"] = "fallback_nmck"
+                logger.info(
+                    f"[{self.VERSION}] Fallback Обучение: {estimated} слушателей → сохранено в tender_info"
+                )
+        # ==========================================
+
+        # Шаг 4: Глобальные затраты (ЭТП, обеспечение, специалист, срочность)
         deadline_days = tender_info.get("deadline_days", 30)
 
         etp_commission = self._resolve_etp_commission(tender_info)
@@ -156,7 +218,6 @@ class TenderAnalyzer:
             )
 
         # Шаг 7: Анализ рисков
-        deadline_days = tender_info.get("deadline_days")
         if deadline_days is None or (
             isinstance(deadline_days, (int, float)) and deadline_days <= 0
         ):

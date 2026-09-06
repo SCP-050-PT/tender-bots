@@ -176,9 +176,6 @@ class TypeDetector:
             for ttype, keywords in TYPE_KEYWORDS.items():
                 for keyword in keywords:
                     if keyword.lower() in text_lower:
-                        logger.info(
-                            f"[TypeDetector] Ключевое слово '{keyword}' в {source} -> {ttype}"
-                        )
                         return ttype, f"keyword:{source}"
 
         return None, "undetermined"

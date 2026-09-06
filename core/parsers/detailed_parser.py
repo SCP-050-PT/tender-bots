@@ -25,7 +25,6 @@ class DetailedParser:
         self.session_manager = session_manager
         self.html44 = Html44Parser()
         self.html223 = Html223Parser()
-        logger.info("DetailedParser инициализирован (v6.8.6-r3-p3)")
         self._last_notice_guid = None
 
     def fetch_and_parse(
@@ -144,9 +143,6 @@ class DetailedParser:
             m = re.search(r"noticeGuid=([0-9a-fA-F\-]{36})", final_url)
             if m:
                 self._last_notice_guid = m.group(1)
-                logger.info(
-                    f"[v6.8.6-r3-p3] noticeGuid из редиректа: {self._last_notice_guid}"
-                )
 
             if not self._last_notice_guid:
                 # Паттерны для поиска noticeGuid в HTML
@@ -166,9 +162,6 @@ class DetailedParser:
                     m2 = re.search(pattern, response.text)
                     if m2:
                         self._last_notice_guid = m2.group(1)
-                        logger.info(
-                            f"[v6.8.6-r3-p3] noticeGuid из HTML ({pattern[:30]}...): {self._last_notice_guid}"
-                        )
                         break
 
             html = response.text
@@ -250,14 +243,14 @@ class DetailedParser:
 
         region = self._extract_region(soup, law, lot_info)
 
+        nmck_val = self._extract_nmck(soup)
+
         if law == "223-FZ" and lot_list_soup:
-            ktru = KtruParser.parse_223_lot_list(lot_list_soup)
+            ktru = KtruParser.parse_223_lot_list(lot_list_soup, nmck=nmck_val)
         else:
-            ktru = KtruParser.parse(soup)
+            ktru = KtruParser.parse(soup, nmck=nmck_val)
 
         # === НОВОЕ: Парсим документы из вкладки "Документы" ===
-        documents = self._parse_documents(documents_html, law)
-                # === НОВОЕ: Парсим документы из вкладки "Документы" ===
         documents = self._parse_documents(documents_html, law)
 
         # v7.2.1: Парсим обеспечение заявки и контракта

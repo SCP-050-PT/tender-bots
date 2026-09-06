@@ -1,24 +1,27 @@
 #!/usr/bin/env python3
 """
 main.py
-Интеграционный скрипт TENDER-BOT v7.0.0.
+Интеграционный скрипт TENDER-BOT v7.5.0.
 Пайплайн: Поиск -> Детальный парсинг -> LLM-анализ -> Расчёт -> Риски -> Google Sheets
 
-v7.0.0: Рефакторинг
-  - Убран _detect_type_from_title() (дубль TypeService)
-  - Убрано дублирование логов
-  - type_hint определяется ТОЛЬКО через TypeService
-  - Исправлена передача documents_text в fallback
+v7.5.0: Исправления
+  - P1-4: Страховка _get_quantity с fallback по НМЦК (никаких ? в таблице)
+  - Расширен контекст агента: добавлены данные КТРУ и структура НМЦК
+  - Санитайзер эмодзи для Google Sheets (замена на [HIGH], [LOW] и т.д.)
+  - Исправлен подсчет лимита (кэш не расходует слоты)
+  - Очищены логи (кэш на DEBUG, добавлена итоговая статистика)
 """
 
 import sys
+import re
 import argparse
 import json
 import csv
 from pathlib import Path
 from datetime import datetime
 from core.daily_limiter import DailyLimiter
-# === ЛОГИРОВАНИЕ (ОДИН источник) ===
+
+# === ЛОГИРОВАНИЕ (ТРИ источника) ===
 LOG_DIR = Path(__file__).resolve().parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 
@@ -27,19 +30,35 @@ try:
 
     logger.remove()
 
-    # v7.3.0: Консольный лог INFO
+    # 1. Консольный лог INFO (чистый, без отладочного шума)
     logger.add(
         sys.stdout,
         level="INFO",
         format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | {message}",
     )
 
+    # 2. Единый "живой" лог для мониторинга в реальном времени
     logger.add(
-        sys.stdout,
-        level="WARNING",
-        format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | {message}",
-        filter=lambda record: record["name"] == "__main__",
+        "tender.log",
+        level="DEBUG",
+        rotation="10 MB",
+        retention="7 days",
+        encoding="utf-8",
+        backtrace=True,
+        diagnose=True,
     )
+
+    # 3. Архивные логи с датой запуска
+    logger.add(
+        LOG_DIR / "run_{time:YYYYMMDD_HHmmss}.log",
+        level="DEBUG",
+        rotation=None,
+        retention="30 days",
+        encoding="utf-8",
+        backtrace=True,
+        diagnose=True,
+    )
+
 except ImportError:
     import logging
 
@@ -65,8 +84,6 @@ def _parse_deadline_to_days(deadline_date_str: str) -> int:
     """Парсит строку даты дедлайна в количество дней до него."""
     if not deadline_date_str:
         return 30
-
-    import re
 
     formats = [
         "%d.%m.%Y",
@@ -97,8 +114,48 @@ def _parse_deadline_to_days(deadline_date_str: str) -> int:
     return 30
 
 
-def _build_tender_text(detail, documents_text: str) -> str:
-    """Строит структурированный текст тендера для LLM."""
+def _sanitize_for_sheets(text: str) -> str:
+    """Заменяет эмодзи на текстовые маркеры для корректного отображения в Google Sheets."""
+    if not isinstance(text, str):
+        return text
+
+    replacements = {
+        "🟢": "[LOW]",
+        "🟡": "[MED]",
+        "🔴": "[HIGH]",
+        "": "[UNKNOWN]",
+        "⚠️": "[WARN]",
+        "": "[BLOCK]",
+        "✅": "[OK]",
+        "⛔": "[FORBIDDEN]",
+        "📊": "[CALC]",
+        "💰": "[PRICE]",
+        "📋": "[LIST]",
+        "🔬": "[LAB]",
+    }
+
+    result = text
+    for emoji, replacement in replacements.items():
+        result = result.replace(emoji, replacement)
+
+    # Удаляем оставшиеся эмодзи
+    emoji_pattern = re.compile(
+        "["
+        "\U0001f600-\U0001f64f"
+        "\U0001f300-\U0001f5ff"
+        "\U0001f680-\U0001f6ff"
+        "\U0001f1e0-\U0001f1ff"
+        "\U00002702-\U000027b0"
+        "\U000024c2-\U0001f251"
+        "]+",
+        flags=re.UNICODE,
+    )
+
+    return emoji_pattern.sub("", result)
+
+
+def _build_tender_text(detail, documents_text: str, tender_info: dict = None) -> str:
+    """Строит структурированный текст тендера для LLM с данными КТРУ и НМЦК."""
     parts = [
         f"НАЗВАНИЕ ЗАКУПКИ: {detail.purchase_name or detail.tender_id}",
         f"ЗАКАЗЧИК: {detail.customer_name or 'не указан'}",
@@ -117,11 +174,35 @@ def _build_tender_text(detail, documents_text: str) -> str:
         f"РЕГИОНОВ ПОСТАВКИ: {detail.regions_count or 1}",
     ]
 
+    # === РАСШИРЕННЫЙ КОНТЕКСТ ДЛЯ АГЕНТА ===
+    if tender_info:
+        # Данные КТРУ
+        ktru_parts = []
+        if tender_info.get("rm_total"):
+            ktru_parts.append(
+                f"  РМ: {tender_info['rm_total']} (источник: {tender_info.get('rm_total_source', 'парсер')})"
+            )
+        if tender_info.get("students_count"):
+            ktru_parts.append(
+                f"  Слушатели: {tender_info['students_count']} (источник: {tender_info.get('students_count_source', 'парсер')})"
+            )
+        if tender_info.get("points_count"):
+            ktru_parts.append(f"  Точки ПЛК: {tender_info['points_count']}")
+        if tender_info.get("opr_positions"):
+            ktru_parts.append(f"  Должности ОПР: {tender_info['opr_positions']}")
+
+        if ktru_parts:
+            parts.append("")
+            parts.append("[ДАННЫЕ КТРУ ИЗ КАРТОЧКИ ЗАКУПКИ]:")
+            parts.extend(ktru_parts)
+
+    # Текст документов
     if documents_text and len(documents_text) > 100:
         prioritized_text = _prioritize_documents(documents_text)
-        parts.append(f"ТЕКСТ ДОКУМЕНТОВ (ТЗ, извещение): {prioritized_text[:12000]}")
+        parts.append(f"\nТЕКСТ ДОКУМЕНТОВ (ТЗ, извещение):\n{prioritized_text[:12000]}")
     else:
-        parts.append("ДОКУМЕНТЫ: не удалось извлечь текст")
+        parts.append("\nДОКУМЕНТЫ: не удалось извлечь текст")
+
     return "\n".join(parts)
 
 
@@ -147,7 +228,7 @@ def _prioritize_documents(documents_text: str) -> str:
 
 
 def _get_quantity(analysis) -> int:
-    """Извлекает количество из анализа."""
+    """Извлекает количество из анализа. P1-4: страховка с fallback по НМЦК."""
     if not hasattr(analysis, "details") or analysis.details is None:
         return 1
 
@@ -158,17 +239,43 @@ def _get_quantity(analysis) -> int:
             details.get("rm_total")
             or details.get("points_count")
             or details.get("students_count")
-            or 1
+            or details.get("opr_positions")
         )
-        return int(quantity) if quantity else 1
+        if quantity and quantity > 0:
+            return int(quantity)
+
+        # === СТРАХОВКА: Fallback по НМЦК если в details пусто ===
+        nmck = getattr(analysis, "nmck", 0) or 0
+        ttype = getattr(analysis, "tender_type", "")
+        if nmck > 0 and ttype:
+            divisors = {"sout": 1200, "plk": 500, "opr": 700, "education": 1500}
+            divisor = divisors.get(ttype, 1000)
+            estimated = int(nmck / divisor)
+            logger.debug(
+                f"[P1-4] Fallback quantity для {ttype}: {estimated} (НМЦК/ {divisor})"
+            )
+            return estimated
+
+        return 1
 
     quantity = (
         getattr(details, "rm_total", None)
         or getattr(details, "points_count", None)
         or getattr(details, "students_count", None)
-        or 1
+        or getattr(details, "opr_positions", None)
     )
-    return int(quantity) if quantity else 1
+    if quantity and quantity > 0:
+        return int(quantity)
+
+    # Страховка для object-based details
+    nmck = getattr(analysis, "nmck", 0) or 0
+    ttype = getattr(analysis, "tender_type", "")
+    if nmck > 0 and ttype:
+        divisors = {"sout": 1200, "plk": 500, "opr": 700, "education": 1500}
+        divisor = divisors.get(ttype, 1000)
+        return int(nmck / divisor)
+
+    return 1
 
 
 def _get_guarantee_info(detail, analysis) -> tuple:
@@ -248,24 +355,19 @@ def _build_calculation_breakdown(analysis) -> str:
     lines = []
 
     if tender_type == "sout":
-        lines.append(f"📊 СОУТ (Упрощённая формула)")  # <-- Изменили заголовок
-        lines.append(
-            f"РМ всего: {details.get('rm_total', '?')} × 213₽"
-        )  # <-- Убрали варианты
+        lines.append(f" СОУТ (Упрощённая формула)")
+        lines.append(f"РМ всего: {details.get('rm_total', '?')} × 213₽")
         lines.append(f"База (РМ×213): {details.get('main_calculation', 0):,.0f}₽")
         lines.append(f"Материалы: {details.get('materials_cost', 0):,.0f}₽")
         lines.append(f"Почта: {details.get('delivery_cost', 0):,.0f}₽")
 
-        # Транспортный блок
         lines.append(f"Командировочные:")
         lines.append(f"  Выезд/Бензин: {details.get('travel_cost', 0):,.0f}₽")
         lines.append(
             f"  Замерщик+Суточные: {details.get('measurer_and_daily', 0):,.0f}₽"
         )
         lines.append(f"  Проживание: {details.get('accommodation_cost', 0):,.0f}₽")
-        lines.append(
-            f"  Билеты (среднее): {details.get('flight_cost', 0):,.0f}₽"
-        )  
+        lines.append(f"  Билеты (среднее): {details.get('flight_cost', 0):,.0f}₽")
 
         lines.append(
             f"Города: {details.get('cities_count', 1)}, Регионы: {details.get('regions_count', 1)}"
@@ -273,7 +375,7 @@ def _build_calculation_breakdown(analysis) -> str:
 
     elif tender_type == "education":
         lines.append(
-            f"📚 Обучение | {'Дистант' if details.get('is_distance') else 'Очно'}"
+            f"Обучение | {'Дистант' if details.get('is_distance') else 'Очно'}"
         )
         lines.append(f"Слушателей: {details.get('students_count', '?')}")
         lines.append(f"Удостоверения: {details.get('certificates', 0)} × 60₽")
@@ -298,7 +400,7 @@ def _build_calculation_breakdown(analysis) -> str:
             lines.append(f"  Манекен: {details.get('manikin_days', 0)} дн.")
 
     elif tender_type == "opr":
-        lines.append(f"📋 ОПР")
+        lines.append(f"ОПР")
         lines.append(
             f"РМ/должностей: {details.get('rm_total', details.get('positions_count', '?'))}"
         )
@@ -308,7 +410,7 @@ def _build_calculation_breakdown(analysis) -> str:
         lines.append(f"Маржа: 30%")
 
     elif tender_type == "plk":
-        lines.append(f"🔬 ПЛК")
+        lines.append(f" ПЛК")
         lines.append(f"Точек: {details.get('points_count', '?')}")
         lines.append(f"Себестоимость/точка: 41.9₽")
         lines.append(f"Материалы: {details.get('materials_cost', 0):,.0f}₽")
@@ -317,13 +419,12 @@ def _build_calculation_breakdown(analysis) -> str:
         lines.append(f"Транспорт: {plk_travel:,.0f}₽")
 
     elif tender_type == "testing":
-        lines.append(f"🧪 Testing (ПЛК-калькулятор)")
+        lines.append(f"Testing (ПЛК-калькулятор)")
         lines.append(f"Точек: {details.get('points_count', '?')}")
 
     else:
-        lines.append(f"❓ Тип: {tender_type}")
+        lines.append(f"[?] Тип: {tender_type}")
 
-    # Общие итоговые строки
     lines.append(f"──────────────")
     lines.append(f"Себестоимость: {analysis.cost_price:,.0f}₽")
     lines.append(f"Маржа: {analysis.margin_percent:.1f}%")
@@ -333,7 +434,7 @@ def _build_calculation_breakdown(analysis) -> str:
 
 
 def _build_sheets_row(analysis, detail, tender) -> dict:
-    """Формирует строку для Google Sheets. v7.2.1: новый порядок колонок + фиксы."""
+    """Формирует строку для Google Sheets. v7.5.0: санитайзер эмодзи."""
     quantity = _get_quantity(analysis)
     app_guarantee, contract_guarantee, guarantee_method = _get_guarantee_info(
         detail, analysis
@@ -347,17 +448,13 @@ def _build_sheets_row(analysis, detail, tender) -> dict:
 
     tender_url = tender.url
 
-    needs_manual = getattr(analysis, "needs_manual_review", False)
+    # ИИ-комментарий → колонка R (с санитайзером)
+    ai_comment = _sanitize_for_sheets(analysis.comment or "")
 
-    # v7.2.1: ИИ-комментарий → колонка R (не X)
-    ai_comment = analysis.comment or ""
-
-    # v7.2.1: Наименование — приоритет tender.title, fallback detail.purchase_name (>10 символов)
     purchase_name = tender.title or ""
     if detail and detail.purchase_name and len(detail.purchase_name) > 10:
         purchase_name = detail.purchase_name
 
-    # v7.2.1: ЭТП — 3 источника с правильным приоритетом
     etp_name = ""
     if detail:
         etp_name = detail.platform_name or detail.etp or ""
@@ -366,14 +463,12 @@ def _build_sheets_row(analysis, detail, tender) -> dict:
     elif detail and hasattr(detail, "etp") and detail.etp:
         etp_name = detail.etp
 
-    # v7.2.1: Срок подачи — 2 источника
     deadline = ""
     if detail and detail.deadline_date:
         deadline = detail.deadline_date
     elif hasattr(tender, "deadline_date") and tender.deadline_date:
         deadline = tender.deadline_date
 
-    # v7.2.0: Запрещённое направление — override решения
     decision_override = analysis.decision
     if hasattr(analysis, "details") and analysis.details:
         details = analysis.details
@@ -382,63 +477,57 @@ def _build_sheets_row(analysis, detail, tender) -> dict:
         ) or getattr(details, "_forbidden_direction", False)
         if is_forbidden:
             decision_override = "не рекомендуется"
-            ai_comment = "⛔ ЗАПРЕЩЁННОЕ НАПРАВЛЕНИЕ: " + ai_comment
+            ai_comment = "[FORBIDDEN] ЗАПРЕЩЁННОЕ НАПРАВЛЕНИЕ: " + ai_comment
 
-    # v7.2.1: Новый порядок колонок A-W
     return {
-        "ID тендера": tender.tender_id,  # A
-        "Ссылка на тендер": tender_url,  # B
-        "Наименование услуг": purchase_name,  # C
-        "Способ проведения закупки": procurement,  # D
-        "ЭТП": etp_name,  # E
-        "Комиссия ЭТП": (  # F
+        "ID тендера": tender.tender_id,
+        "Ссылка на тендер": tender_url,
+        "Наименование услуг": purchase_name,
+        "Способ проведения закупки": procurement,
+        "ЭТП": etp_name,
+        "Комиссия ЭТП": (
             f"{analysis.details.get('etp_commission', 0):,.0f} ₽"
             if analysis.details
             else ""
         ),
-        "Регион": (  # G
+        "Регион": (
             detail.customer_region if detail else (getattr(tender, "region", "") or "")
         ),
-        "Обеспечение заявки": app_guarantee,  # H
-        "Обеспечение контракта": contract_guarantee,  # I
-        "Способ обеспечения исполнения": guarantee_method,  # J
-        "Срок подачи заявки до": deadline,  # K
-        "НМЦК": _format_nmck((detail.nmck if detail else 0) or analysis.nmck),  # L
-        "Количество": quantity,  # M
-        "Цена предложения": _format_price(analysis.recommended_price),  # N
-        "Возможности экономии": "",  # O ← ручное
-        "Решение по участию": decision_override,  # Q
-        "Расчёты": _build_calculation_breakdown(analysis),
-        "Комментарий от ИИ-агента": ai_comment,  # R ← полный анализ ИИ
-        "Рекомендации": _build_short_recommendation(analysis),
-        "Комментарии руководителя отдела по участию": "",  # T ← ручное
-        "Дата заключения контракта": "",  # U ← ручное
-        "Дата выполнения работ": "",  # V ← ручное
-        "Результат": "",  # W ← ручное (в конце)
+        "Обеспечение заявки": app_guarantee,
+        "Обеспечение контракта": contract_guarantee,
+        "Способ обеспечения исполнения": guarantee_method,
+        "Срок подачи заявки до": deadline,
+        "НМЦК": _format_nmck((detail.nmck if detail else 0) or analysis.nmck),
+        "Количество": quantity,
+        "Цена предложения": _format_price(analysis.recommended_price),
+        "Возможности экономии": "",
+        "Решение по участию": decision_override,
+        "Расчёты": _sanitize_for_sheets(_build_calculation_breakdown(analysis)),
+        "Комментарий от ИИ-агента": ai_comment,
+        "Рекомендации": _sanitize_for_sheets(_build_short_recommendation(analysis)),
+        "Комментарии руководителя отдела по участию": "",
+        "Дата заключения контракта": "",
+        "Дата выполнения работ": "",
+        "Результат": "",
     }
 
 
 def _build_short_recommendation(analysis) -> str:
-    """Формирует краткую рекомендацию для колонки S."""
+    """Формирует краткую рекомендацию для колонки S (без эмодзи)."""
     parts = []
 
-    # Тип тендера
     parts.append(f"Тип: {analysis.tender_type}")
-
-    # Себестоимость и цена
     parts.append(f"Себестоимость: {analysis.cost_price:,.0f} ₽")
     parts.append(f"Рекомендуемая цена: {analysis.recommended_price:,.0f} ₽")
     parts.append(f"Маржа: {analysis.margin_percent:.1f}%")
 
-    # Риск
-    risk_emoji = {"low": "🟢", "medium": "🟡", "high": "🔴"}.get(
-        analysis.risk_level, "⚪"
+    risk_label = {"low": "[LOW]", "medium": "[MED]", "high": "[HIGH]"}.get(
+        analysis.risk_level, "[UNKNOWN]"
     )
-    parts.append(f"Риск: {risk_emoji} {analysis.risk_level}")
+    parts.append(f"Риск: {risk_label}")
 
-    # Нарушения лимитов
     if hasattr(analysis, "guard_violations") and analysis.guard_violations:
-        parts.append(f"⚠️ {len(analysis.guard_violations)} нарушений лимитов")
+        parts.append(f"[WARN] {len(analysis.guard_violations)} нарушений лимитов")
 
     return " | ".join(parts)
 
@@ -446,7 +535,7 @@ def _build_short_recommendation(analysis) -> str:
 def run_parse_only(max_pages: int = None, max_results: int = None):
     """Режим только парсинга (без LLM)."""
     logger.info("=" * 60)
-    logger.info("🔍 РЕЖИМ: Только парсинг (без LLM)")
+    logger.info(" РЕЖИМ: Только парсинг (без LLM)")
     logger.info("=" * 60)
 
     searcher = create_searcher()
@@ -458,28 +547,26 @@ def run_parse_only(max_pages: int = None, max_results: int = None):
         max_results=max_results,
     )
 
-    logger.info(f"✅ Найдено тендеров: {len(results)}")
-    logger.info(f"💾 Сохранено в: {output_file}")
+    logger.info(f" Найдено тендеров: {len(results)}")
+    logger.info(f" Сохранено в: {output_file}")
     return results
 
 
 def run_analyze(
     max_pages: int = None, max_results: int = None, skip_detail: bool = False
 ):
-    """Полный анализ с LLM. v7.2.5: исправлен порядок кэша и лимитов."""
+    """Полный анализ с LLM. v7.5.0: расширенный контекст агента + санитайзер."""
     logger.info("=" * 60)
-    logger.info("🤖 РЕЖИМ: Полный анализ с LLM")
+    logger.info(" РЕЖИМ: Полный анализ с LLM")
 
-    # === v7.2.2: Лимиты + очистка ===
     limiter = DailyLimiter()
     logger.info(limiter.get_status())
 
     can_run, reason = limiter.can_run()
     if not can_run:
-        logger.error(f"🚫 Запуск отменён: {reason}")
+        logger.error(f" Запуск отменён: {reason}")
         return [], []
 
-    # Очистка старых файлов (downloads), но НЕ кэша ID
     limiter.cleanup_all()
     logger.info("=" * 60)
 
@@ -488,7 +575,7 @@ def run_analyze(
 
     errors = settings.validate()
     if errors:
-        logger.error("❌ Ошибки конфигурации:")
+        logger.error(" Ошибки конфигурации:")
         for err in errors:
             logger.error(f"   • {err}")
         sys.exit(1)
@@ -507,63 +594,62 @@ def run_analyze(
     try:
         cache_db = Path(__file__).resolve().parent / "data" / "tender_cache.db"
         cache = TenderCache(db_path=cache_db)
-        logger.info(f"📂 Кэш: {cache_db}")
+        logger.debug(f" Кэш инициализирован: {cache_db}")
     except Exception as e:
-        logger.warning(f"⚠️ Кэш не инициализирован: {e}")
+        logger.warning(f" Кэш не инициализирован: {e}")
 
     detailed = None
     if not skip_detail:
         try:
             detailed = DetailedParser(session_manager=searcher.session_manager)
-            logger.info("📄 DetailedParser инициализирован с session_manager")
+            logger.debug(" DetailedParser инициализирован")
         except Exception as e:
-            logger.warning(f"⚠️ DetailedParser не инициализирован: {e}")
+            logger.warning(f" DetailedParser не инициализирован: {e}")
 
-        # === ПОЛНОЕ ОТКЛЮЧЕНИЕ GOOGLE SHEETS ДЛЯ ТЕСТА ===
     sheets_manager = None
-    logger.warning(
-        "⚠️ ВНИМАНИЕ: Запись в Google Sheets ПРИНУДИТЕЛЬНО ОТКЛЮЧЕНА в коде (тестовый режим)"
-    )
+    try:
+        from core.google_sheets import get_sheets_manager
 
-    # Закомментируйте или удалите старый блок:
-    # sheets_enabled = getattr(settings, "GOOGLE_SHEETS_ENABLED", True)
-    # if sheets_enabled:
-    #     try:
-    #         from core.google_sheets import get_sheets_manager
-    #         sheets_manager = get_sheets_manager()
-    #         logger.info("📊 Google Sheets подключен")
-    #     except Exception as e:
-    #         logger.warning(f"⚠️ Google Sheets не подключен: {e}")
-    # else:
-    #     logger.info("📊 Google Sheets отключен в настройках")
+        sheets_manager = get_sheets_manager()
+        logger.info(" Google Sheets подключен")
+    except Exception as e:
+        logger.warning(f" Google Sheets не подключен: {e}")
 
-    logger.info("🔍 Начинаю поиск тендеров...")
+    logger.info(" Начинаю поиск тендеров...")
     results = []
     sheets_rows = []
-    duplicates_skipped = 0  # Счётчик дублей
 
-    for tender in searcher.search(max_pages=max_pages, max_results=max_results):
+    analyzed_count = 0
+    duplicates_skipped = 0
 
-        # ==========================================================
-        # v7.2.5: РАННЯЯ ПРОВЕРКА КЭША (ДО ПАРСИНГА!)
-        # ==========================================================
+    for tender in searcher.search(max_pages=max_pages, max_results=None):
+
+        # 1. КЭШ
         if limiter.is_cached(tender.tender_id):
-            logger.info(f"   ⏭️ Кэш: {tender.tender_id} уже обрабатывался, пропуск")
+            logger.debug(f" Кэш: {tender.tender_id}")
             duplicates_skipped += 1
             continue
 
-        # ==========================================================
-        # v7.2.5: ПРОВЕРКА ЛИМИТА ЗА ЗАПУСК (ДО ПАРСИНГА!)
-        # ==========================================================
-        if len(results) >= limiter.MAX_PER_RUN:
-            logger.info(f"   ⏹️ Лимит за запуск ({limiter.MAX_PER_RUN}) достигнут")
+        # 2. SHEETS
+        if sheets_manager and sheets_manager.check_exists(tender.tender_id):
+            logger.info(f"   Уже в Sheets: {tender.tender_id}")
+            limiter.add_to_cache(tender.tender_id)
+            duplicates_skipped += 1
+            continue
+
+        # 3. ЛИМИТ ТОЛЬКО ПО НОВЫМ
+        max_per_run = max_results or limiter.MAX_PER_RUN
+        if analyzed_count >= max_per_run:
+            logger.info(
+                f" Достигнут лимит новых тендеров: {analyzed_count}/{max_per_run}"
+            )
             break
 
         logger.info(f"\n{'-' * 60}")
-        logger.info(f"🆔 {tender.tender_id} | {tender.law}")
-        logger.info(f"📌 {tender.title[:80]}...")
+        logger.info(f" {tender.tender_id} | {tender.law}")
+        logger.info(f" {tender.title[:80]}...")
         logger.info(
-            f"💰 НМЦК: {tender.nmck:,.0f} ₽" if tender.nmck else "💰 НМЦК: не указана"
+            f" НМЦК: {tender.nmck:,.0f} ₽" if tender.nmck else " НМЦК: не указана"
         )
 
         detail = None
@@ -586,14 +672,14 @@ def run_analyze(
 
                 if detail:
                     logger.info(
-                        f"   ✅ Детали получены: {detail.customer_region or 'регион не определён'}"
+                        f"   Детали получены: {detail.customer_region or 'регион не определён'}"
                     )
-                    logger.info(f"   📄 Документов: {len(detail.documents)}")
+                    logger.info(f"   Документов: {len(detail.documents)}")
                     logger.info(
-                        f"   🏢 ЭТП: {detail.platform_name or detail.etp or 'не определена'}"
+                        f"   ЭТП: {detail.platform_name or detail.etp or 'не определена'}"
                     )
                     logger.info(
-                        f"   🔒 Обеспечение: {detail.application_guarantee or 'не указано'}"
+                        f"   Обеспечение: {detail.application_guarantee or 'не указано'}"
                     )
 
                     documents_text = ""
@@ -620,10 +706,10 @@ def run_analyze(
                             documents_text = doc_processor.process_documents(docs)
                             detail.documents_text = documents_text
                             logger.info(
-                                f"   📄 Текст документов: {len(documents_text)} симв."
+                                f"   Текст документов: {len(documents_text)} симв."
                             )
                         except Exception as e:
-                            logger.warning(f"   ⚠️ Ошибка обработки документов: {e}")
+                            logger.warning(f"   Ошибка обработки документов: {e}")
 
                     if not documents_text:
                         documents_text = detail.documents_text or ""
@@ -635,9 +721,9 @@ def run_analyze(
                     else:
                         tender_text = _build_tender_text(detail, documents_text)
                 else:
-                    logger.warning(f"   ⚠️ Детальный парсинг вернул None")
+                    logger.warning(f"   Детальный парсинг вернул None")
             except Exception as e:
-                logger.error(f"   ❌ Ошибка детального парсинга: {e}")
+                logger.error(f"   Ошибка детального парсинга: {e}")
                 detail = None
 
         # === ШАГ 2: Fallback — упрощённый текст ===
@@ -660,7 +746,7 @@ def run_analyze(
 
 ЗАКОН:
 {tender.law}{doc_part}"""
-            logger.info("   ℹ️ Используется упрощённый текст (title only)")
+            logger.info("   Используется упрощённый текст (title only)")
 
         # === ШАГ 3: LLM-анализ ===
         try:
@@ -677,9 +763,6 @@ def run_analyze(
                     or "",
                     "nmck": detail.nmck or tender.nmck or 0,
                     "deadline_date": detail.deadline_date or tender.deadline_date or "",
-                    "region": detail.customer_region
-                    or getattr(tender, "region", "")
-                    or "",
                     "deadline_days": _parse_deadline_to_days(
                         detail.deadline_date or tender.deadline_date or ""
                     ),
@@ -743,7 +826,7 @@ def run_analyze(
 
             type_hint = detail.tender_type_hint if detail else None
 
-            logger.info(
+            logger.debug(
                 f"[DEBUG] Passing to analyzer: nmck={tender.nmck}, "
                 f"region={tender_info.get('region', 'N/A')}, "
                 f"text_length={len(tender_text)}, "
@@ -753,7 +836,6 @@ def run_analyze(
                 f"type_hint={type_hint}"
             )
 
-            # v7.1.0: Проверка search title
             if not type_hint and tender.title:
                 from core.services.type_service import TypeService
 
@@ -762,19 +844,20 @@ def run_analyze(
                 for _ttype, _keywords in _ts.TITLE_KEYWORDS.items():
                     if any(_kw in _title_lower for _kw in _keywords):
                         type_hint = _ttype
-                        logger.info(f"[v7.1.0] Type hint из search title: {_ttype}")
+                        logger.debug(f"[v7.1.0] Type hint из search title: {_ttype}")
                         break
 
-            # ==========================================================
-            # v7.2.4: ПРИОРИТЕТ EDUCATION НАД SOUT (ИСПРАВЛЕНО)
-            # ==========================================================
+            # ПРИОРИТЕТ EDUCATION НАД SOUT (дублируем здесь для надежности)
             if detail and (detail.students_count or 0) > 0 and type_hint == "sout":
                 logger.warning(
                     f"[v7.2.4] Override: sout → education "
-                    f"(КТРУ дал {detail.students_count} слушателей, "
-                    f"приоритет обучения над СОУТ)"
+                    f"(КТРУ дал {detail.students_count} слушателей)"
                 )
                 type_hint = "education"
+
+            # Передаем tender_info в _build_tender_text для расширенного контекста
+            if detail and not tender_text:
+                tender_text = _build_tender_text(detail, documents_text, tender_info)
 
             analysis = analyzer.analyze(
                 tender_info=tender_info,
@@ -784,7 +867,7 @@ def run_analyze(
                 tender_type_hint=type_hint,
             )
 
-            logger.info(
+            logger.debug(
                 f"[DEBUG] Analysis result: type={analysis.tender_type}, "
                 f"cost_price={analysis.cost_price}, "
                 f"recommended_price={analysis.recommended_price}, "
@@ -794,30 +877,25 @@ def run_analyze(
             )
 
             result_dict = analysis.to_dict()
-            results.append(result_dict)
 
             row = _build_sheets_row(analysis, detail, tender)
             sheets_rows.append(row)
 
-            # ==========================================================
-            # v7.2.5: ДОБАВЛЕНИЕ В КЭШ (ПОСЛЕ УСПЕШНОГО АНАЛИЗА)
-            # ==========================================================
+            # ИНКРЕМЕНТ СЧЕТЧИКА И КЭШ
+            analyzed_count += 1
             limiter.add_to_cache(tender.tender_id)
+            results.append(result_dict)
 
+            # Запись в Sheets
             if sheets_manager:
                 try:
-                    success = sheets_manager.add_tender_to_top(
-                        row, check_duplicate=True
-                    )
-                    if success:
-                        logger.info(f"   ✅ Записано в Google Sheets")
-                    else:
-                        logger.info(f"   ⚠️ Дубликат в Sheets — пропущено")
+                    sheets_manager.add_tender_to_top(row, check_duplicate=False)
+                    logger.info(f"   Записано в Google Sheets")
                 except Exception as e:
-                    logger.warning(f"   ⚠️ Ошибка записи в Sheets: {e}")
+                    logger.warning(f"   Ошибка записи в Sheets: {e}")
 
             print(f"\n{'=' * 60}")
-            print(f"📊 РЕЗУЛЬТАТ: {tender.tender_id}")
+            print(f" РЕЗУЛЬТАТ: {tender.tender_id}")
             print(f"{'=' * 60}")
             print(f"Тип: {analysis.tender_type}")
             print(f"НМЦК: {analysis.nmck:,.0f} ₽")
@@ -826,7 +904,7 @@ def run_analyze(
             print(f"Маржа: {analysis.margin_percent:.1f}%")
             print(f"Риск: {analysis.risk_level} | Решение: {analysis.decision}")
             if getattr(analysis, "needs_manual_review", False):
-                print(f"⚠️ ТРЕБУЕТСЯ РУЧНАЯ ПРОВЕРКА")
+                print(f" ТРЕБУЕТСЯ РУЧНАЯ ПРОВЕРКА")
             if detail and detail.customer_region:
                 print(f"Регион: {detail.customer_region}")
             if detail and detail.platform_name:
@@ -838,7 +916,7 @@ def run_analyze(
             print(f"{'=' * 60}")
 
         except Exception as e:
-            logger.error(f"❌ Ошибка анализа тендера {tender.tender_id}: {e}")
+            logger.error(f" Ошибка анализа тендера {tender.tender_id}: {e}")
             import traceback
 
             logger.error(traceback.format_exc())
@@ -862,17 +940,17 @@ def run_analyze(
                 indent=2,
                 ensure_ascii=False,
             )
-        logger.info(f"\n💾 JSON сохранён: {json_file}")
+        logger.info(f"\n JSON сохранён: {json_file}")
 
         csv_file = f"data/sheets_export_{timestamp}.csv"
         with open(csv_file, "w", encoding="utf-8-sig", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=SHEET_COLUMNS, extrasaction="ignore")
             writer.writeheader()
             writer.writerows(sheets_rows)
-        logger.info(f"💾 CSV сохранён: {csv_file}")
+        logger.info(f" CSV сохранён: {csv_file}")
 
         print(f"\n{'=' * 60}")
-        print(f"📋 СВОДКА")
+        print(f" СВОДКА")
         print(f"{'=' * 60}")
         print(f"Всего уникальных: {len(results)}")
         print(f"Дубликатов пропущено: {duplicates_skipped}")
@@ -882,10 +960,12 @@ def run_analyze(
             d = r.get("decision", "unknown")
             decisions[d] = decisions.get(d, 0) + 1
         for d, count in decisions.items():
-            emoji = (
-                "✅" if d == "рекомендуется" else "❌" if d == "не участвуем" else "📋"
+            label = (
+                "[OK]"
+                if d == "рекомендуется"
+                else "[BLOCK]" if d == "не участвуем" else ""
             )
-            print(f"{emoji} {d}: {count}")
+            print(f"{label} {d}: {count}")
 
         risks = {}
         for r in results:
@@ -893,14 +973,19 @@ def run_analyze(
             risks[risk] = risks.get(risk, 0) + 1
         print(f"\nРиски:")
         for risk, count in risks.items():
-            emoji = "🟢" if risk == "low" else "🟡" if risk == "medium" else "🔴"
-            print(f"{emoji} {risk}: {count}")
+            label = (
+                "[LOW]" if risk == "low" else "[MED]" if risk == "medium" else "[HIGH]"
+            )
+            print(f"{label} {risk}: {count}")
         print(f"{'=' * 60}")
 
-    # === v7.2.5: ЗАПИСЬ СЧЁТЧИКОВ (ТОЛЬКО УНИКАЛЬНЫЕ) ===
+    # === ФИНАЛЬНАЯ СТАТИСТИКА ===
+    logger.info(
+        f" Итог поиска: проанализировано {analyzed_count}, пропущено из кэша {duplicates_skipped}"
+    )
+
     unique_count = len(results)
     limiter.record_tenders(unique_count)
-    logger.info(f"📊 Уникальных: {unique_count}, дубликатов: {duplicates_skipped}")
 
     return results, sheets_rows
 
@@ -911,7 +996,7 @@ def run_interactive():
 
     errors = settings.validate()
     if errors:
-        logger.error("❌ Ошибки конфигурации:")
+        logger.error(" Ошибки конфигурации:")
         for err in errors:
             logger.error(f"   • {err}")
         sys.exit(1)
@@ -926,7 +1011,7 @@ def run_interactive():
     )
 
     print("\n" + "=" * 60)
-    print("📝 ИНТЕРАКТИВНЫЙ РЕЖИМ")
+    print(" ИНТЕРАКТИВНЫЙ РЕЖИМ")
     print("=" * 60)
     print("Вставьте текст тендера (ТЗ, извещение) и нажмите Enter дважды:")
     print("-" * 60)
@@ -946,7 +1031,7 @@ def run_interactive():
         print("Пустой текст. Отмена.")
         return
 
-    print("\n🤖 Анализирую...")
+    print("\n Анализирую...")
     try:
         tender_info = {"documents_text": tender_text}
         result = analyzer.analyze(
@@ -956,7 +1041,7 @@ def run_interactive():
         result_dict = result.to_dict()
 
         print("\n" + "=" * 60)
-        print("📊 РЕЗУЛЬТАТ АНАЛИЗА")
+        print(" РЕЗУЛЬТАТ АНАЛИЗА")
         print("=" * 60)
         print(f"Тип: {result_dict['tender_type']}")
         print(f"НМЦК: {result_dict['nmck']:,.0f} ₽")
@@ -966,7 +1051,7 @@ def run_interactive():
         print(f"Риск: {result_dict['risk_level']}")
         print(f"Решение: {result_dict['decision']}")
         if result_dict.get("needs_manual_review"):
-            print("⚠️ ТРЕБУЕТСЯ РУЧНАЯ ПРОВЕРКА")
+            print(" ТРЕБУЕТСЯ РУЧНАЯ ПРОВЕРКА")
         if result_dict.get("llm_confidence") is not None:
             print(f"Уверенность ИИ: {result_dict['llm_confidence']:.2f}")
         print("-" * 60)
@@ -979,7 +1064,7 @@ def run_interactive():
         print("=" * 60)
 
     except Exception as e:
-        logger.error(f"❌ Ошибка: {e}")
+        logger.error(f" Ошибка: {e}")
         import traceback
 
         logger.error(traceback.format_exc())
@@ -987,7 +1072,7 @@ def run_interactive():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="TENDER-BOT v7.0.0: Анализ тендеров с ИИ",
+        description="TENDER-BOT v7.5.0: Анализ тендеров с ИИ",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Примеры:

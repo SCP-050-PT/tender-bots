@@ -126,9 +126,6 @@ class TenderCache:
 
         self._init_db()
         self._cleanup_old_entries()
-
-        logger.info(f"📂 TenderCache инициализирован: {self.db_path}")
-
     # ------------------------------------------------------------------------
     # DATABASE LAYER
     # ------------------------------------------------------------------------

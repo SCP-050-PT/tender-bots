@@ -1,0 +1,50 @@
+{
+  "description": "Формулы, коэффициенты и guard'ы для расчета себестоимости и цены участия.",
+  "global_limits": {
+    "min_margin_percent": 10.0,
+    "max_cost_to_nmck_ratio": 0.9,
+    "urgency_multiplier_threshold_days": 14,
+    "urgency_overhead_increase": 0.5
+  },
+  "etp_commissions": {
+    "ртс-тендер": 1.0,
+    "сбербанк-аст": 0.5,
+    "фабрикант": 1.5,
+    "еэтп": 1.0,
+    "агора": 0.8
+  },
+  "type_specific_rules": {
+    "sout": {
+      "base_price_per_rm": 213,
+      "materials_per_rm": 73,
+      "delivery_cost": 2000,
+      "measurer_daily": 15000,
+      "accommodation_per_night": 5000,
+      "flight_avg": 8000,
+      "specialist_hourly": 100,
+      "specialist_hours_base": 3
+    },
+    "education": {
+      "portal_fee_per_student": 57,
+      "certificate_cost": 60,
+      "diploma_cost": 265,
+      "protocol_cost": 3.65,
+      "qual_cert_cost": 130,
+      "labor_specialist": 300,
+      "labor_methodist": 681,
+      "labor_ro": 1800,
+      "distance_transport_km_rate": 0,
+      "full_time_teacher_daily": 0,
+      "full_time_venue_daily": 0,
+      "full_time_manikin_daily": 0
+    },
+    "opr": {
+      "siz_norms_cost_per_position": 200,
+      "margin_percent": 30.0
+    },
+    "plk": {
+      "base_cost_per_point": 41.9,
+      "subcontractor_markup": 0
+    }
+  }
+}

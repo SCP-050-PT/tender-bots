@@ -176,11 +176,6 @@ class ExcelExtractor(BaseExtractor):
                 quantity_col_idx = self._find_quantity_column(headers)
                 service_col_idx = self._find_service_column(headers)
                 unit_price_col_idx = self._find_unit_price_column(headers)
-                logger.info(
-                    f"[ExcelExtractor] Заголовки на строке {row_idx}: "
-                    f"qty={quantity_col_idx}, svc={service_col_idx}, "
-                    f"price={unit_price_col_idx}"
-                )
                 # Debug только если цена не найдена
                 if unit_price_col_idx == -1:
                     logger.debug(
@@ -320,11 +315,6 @@ class ExcelExtractor(BaseExtractor):
                 quantity_col_idx = self._find_quantity_column(headers)
                 service_col_idx = self._find_service_column(headers)
                 unit_price_col_idx = self._find_unit_price_column(headers)
-                logger.info(
-                    f"[ExcelExtractor] Заголовки на строке {row_idx}: "
-                    f"qty={quantity_col_idx}, svc={service_col_idx}, "
-                    f"price={unit_price_col_idx}"
-                )
                 # Debug только если цена не найдена
                 if unit_price_col_idx == -1:
                     logger.debug(
@@ -477,19 +467,12 @@ class ExcelExtractor(BaseExtractor):
         if service_col_idx >= 0 and service_col_idx < len(row_values):
             service_str = str(row_values[service_col_idx]).lower()
             if any(kw in service_str for kw in SERVICE_ROW_KEYWORDS):
-                logger.info(
-                    f"[ExcelExtractor] Найдено qty={qty} (услуга: {service_str[:50]})"
-                )
                 return qty
-
         # Для «Обоснования НМЦК» — не требуем колонку услуги
         if is_nmck_file:
-            logger.info(f"[ExcelExtractor] Найдено qty={qty} (Обоснование НМЦК)")
             return qty
-
         # Если нет колонки услуги и это не НМЦК — всё равно возвращаем
         if service_col_idx < 0:
-            logger.info(f"[ExcelExtractor] Найдено qty={qty} (без колонки услуги)")
             return qty
 
         return None

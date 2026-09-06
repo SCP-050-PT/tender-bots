@@ -88,8 +88,6 @@ class DocumentProcessor:
             "rtf": TextExtractor(),
         }
 
-        logger.info(f"[DocumentProcessor] download_dir={self.download_dir}")
-
     def process_documents(
         self,
         documents: List[DocumentInfo],
@@ -231,8 +229,6 @@ class DocumentProcessor:
 
     def _process_single_document(self, doc: DocumentInfo) -> str:
         """Обрабатывает один документ."""
-        logger.info(f"[DocumentProcessor] Обработка: {doc.name} ({doc.file_type})")
-
         # Пропускаем большие контракты
         if doc.is_contract and doc.file_size_bytes > MAX_CONTRACT_FILE_SIZE:
             logger.info(f"[DocumentProcessor] Пропущен (контракт >200 KB): {doc.name}")
@@ -318,10 +314,6 @@ class DocumentProcessor:
 
             with open(file_path, "wb") as f:
                 f.write(response.content)
-
-            logger.info(
-                f"[DocumentProcessor] Скачан: {file_path} ({content_length} байт)"
-            )
             return file_path
 
         except Exception as e:

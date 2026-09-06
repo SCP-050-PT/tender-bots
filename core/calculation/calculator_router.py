@@ -1,11 +1,13 @@
 """
-core/analysis/calculator_router.py
+core/calculation/calculator_router.py
 Маршрутизация расчётов по типам тендеров.
-v7.3.0:
-  - Fallback для ОПР (оценка по НМЦК).
-  - Поддержка ОПР в комбинированных тендерах.
-  - Проверка аккредитации для ПЛК.
-  - Защита от ложного ОПР (ЭТЛ, пожарка).
+
+v7.5.0:
+  - Добавлена поддержка ПЛК в комбинированных тендерах (P0-2)
+  - Улучшена логика определения subtypes для combined
+  - Fallback для ОПР (оценка по НМЦК)
+  - Проверка аккредитации для ПЛК
+  - Защита от ложного ОПР (ЭТЛ, пожарка)
 """
 
 from typing import Dict, Any
@@ -18,7 +20,7 @@ from core.calculation.calculation_result import CalculationResult
 
 
 class CalculatorRouter:
-    VERSION = "v7.3.0"
+    VERSION = "v7.5.0"
 
     def __init__(self, calculator: TenderCalculator):
         self.calculator = calculator
@@ -41,6 +43,17 @@ class CalculatorRouter:
     def calculate(
         self, tender_info: Dict[str, Any], tender_type: str, documents_text: str
     ) -> CalculationResult:
+
+        # === v7.4.0: Проверка на блокировку от Агента ===
+        if tender_info.get("blocked_by_agent"):
+            logger.warning(
+                f"[{self.VERSION}] Тендер заблокирован агентом: {tender_info.get('reason')}"
+            )
+            return self._manual_review(
+                tender_info.get("reason", "Заблокировано агентом")
+            )
+        # ==========================================
+
         if tender_type == "sout":
             return self._calc_sout(tender_info)
         elif tender_type == "education":
@@ -57,14 +70,16 @@ class CalculatorRouter:
     # ==================== СОУТ ====================
     def _calc_sout(self, info: Dict[str, Any]) -> CalculationResult:
         rm_total = info.get("rm_total", 0)
-        
+
         # === v7.3.1: Приоритет LLM над fallback ===
         # Если LLM нашёл количество, не используем fallback по НМЦК
         if not rm_total:
             nmck = info.get("nmck", 0)
-            if nmck > 0 and not info.get("llm_found_rm"): # Флаг, что LLM не нашёл
+            if nmck > 0 and not info.get("llm_found_rm"):  # Флаг, что LLM не нашёл
                 estimated_rm = int(nmck / 1200)
-                logger.warning(f"[{self.VERSION}] СОУТ: кол-во не найдено. Оценка по НМЦК: {estimated_rm} РМ")
+                logger.warning(
+                    f"[{self.VERSION}] СОУТ: кол-во не найдено. Оценка по НМЦК: {estimated_rm} РМ"
+                )
                 rm_total = estimated_rm
                 info["needs_manual_review"] = True
             else:
@@ -214,31 +229,40 @@ class CalculatorRouter:
         self, info: Dict[str, Any], documents_text: str = ""
     ) -> CalculationResult:
         points = info.get("measurement_points", 0) or info.get("points_count", 0)
+        measurement_types = info.get(
+            "measurement_types", []
+        )  # <-- НОВОЕ: список факторов от агента
 
-        # v7.3.0: Проверка аккредитации
         needs_subcontractor = info.get("needs_subcontractor", False)
-        if documents_text and self.accreditation:
-            # Простая проверка на ключевые слова вне аккредитации
-            text_lower = documents_text.lower()
-            cannot_measure = self.accreditation.get("cannot_measure", {})
-            for cat, data in cannot_measure.items():
-                examples = data.get("examples", [])
-                if any(ex.lower() in text_lower for ex in examples):
-                    logger.warning(
-                        f"[{self.VERSION}] ПЛК: Обнаружены факторы вне аккредитации ({cat})"
-                    )
-                    needs_subcontractor = True
-                    info["needs_manual_review"] = True
-                    info["review_reason"] = (
-                        f"Факторы вне аккредитации ({cat}). Требуется субподряд."
-                    )
-                    break
+
+        # v7.4.0: Усиленная проверка аккредитации по списку факторов от агента
+        if measurement_types and self.accreditation:
+            can_measure = set(self.accreditation.get("can_measure", []))
+            cannot_measure = set(self.accreditation.get("cannot_measure", []))
+
+            forbidden_found = []
+
+            for factor in measurement_types:
+                f_lower = factor.lower()
+                # Проверяем запрещенные
+                if any(
+                    cm.lower() in f_lower or f_lower in cm.lower()
+                    for cm in cannot_measure
+                ):
+                    forbidden_found.append(factor)
+
+            if forbidden_found:
+                reason = f"Факторы вне аккредитации: {', '.join(forbidden_found)}"
+                logger.warning(f"[{self.VERSION}] ПЛК: {reason}")
+                needs_subcontractor = True
+                info["needs_manual_review"] = True
+                info["review_reason"] = reason
 
         if not points:
             # Fallback для ПЛК
             nmck = info.get("nmck", 0)
             if nmck > 0:
-                points = int(nmck / 500)  # Средняя цена точки ~500
+                points = int(nmck / 500)
                 logger.warning(
                     f"[{self.VERSION}] ПЛК: кол-во точек не найдено. Оценка: {points}"
                 )
@@ -248,7 +272,7 @@ class CalculatorRouter:
 
         return self.calculator.calculate_plk(
             points_count=points,
-            factors_count=info.get("factors_count", 0),
+            factors_count=len(measurement_types),  # <-- Используем реальный список
             delivery_count=info.get("delivery_count", 1),
             is_annual=info.get("is_annual", False),
             needs_subcontractor=needs_subcontractor,
@@ -264,33 +288,49 @@ class CalculatorRouter:
         total_cost = 0.0
         total_recommended = 0.0
         parts = []
+        subtypes = []
 
-        # v7.3.0: Поддержка СОУТ + ОПР + Обучение
+        # v7.5.0: Поддержка СОУТ + ОПР + Обучение + ПЛК
         if info.get("rm_total"):
             sout = self._calc_sout(info)
             total_cost += sout.cost_price
             total_recommended += sout.recommended_price
             parts.append(sout.to_dict())
+            subtypes.append("sout")
+
+        if info.get("measurement_points") or info.get("points_count"):
+            plk = self._calc_plk(info, documents_text)
+            total_cost += plk.cost_price
+            total_recommended += plk.recommended_price
+            parts.append(plk.to_dict())
+            subtypes.append("plk")
 
         if info.get("opr_positions") or info.get("opr_persons"):
             opr = self._calc_opr(info, documents_text)
             total_cost += opr.cost_price
             total_recommended += opr.recommended_price
             parts.append(opr.to_dict())
+            subtypes.append("opr")
 
         if info.get("students_count"):
             edu = self._calc_education(info, documents_text)
             total_cost += edu.cost_price
             total_recommended += edu.recommended_price
             parts.append(edu.to_dict())
+            subtypes.append("education")
 
         if not parts:
             return self._manual_review(
-                "Не определены параметры комбинированного тендера"
+                "Не определены параметры комбинированного тендера (нет данных ни для одной части)"
             )
 
         margin_rub = total_recommended - total_cost
         margin_percent = (margin_rub / total_cost * 100) if total_cost > 0 else 0.0
+
+        logger.info(
+            f"[{self.VERSION}] Combined: рассчитаны части {subtypes}, "
+            f"итоговая себестоимость: {total_cost:,.0f}₽"
+        )
 
         return CalculationResult(
             cost_price=total_cost,
@@ -300,8 +340,8 @@ class CalculatorRouter:
             transport_cost=0.0,
             subcontractor_cost=0.0,
             needs_manual_review=True,
-            review_reason="Комбинированный тендер — требуется ручная проверка",
-            details={"parts": parts},
+            review_reason=f"Комбинированный тендер ({'+'.join(subtypes)}) — требуется ручная проверка",
+            details={"parts": parts, "subtypes": subtypes},
         )
 
     def _manual_review(self, reason: str) -> CalculationResult:

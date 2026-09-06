@@ -57,7 +57,16 @@ class DocxExtractor(BaseExtractor):
             logger.error(f"[DocxExtractor] Файл не является валидным DOCX: {name}")
             return ""
 
-        # Сначала пробуем python-docx с таймаутом
+        # === НОВОЕ: Оптимизация для больших файлов ===
+        file_size = path.stat().st_size
+        MAX_SIZE_FOR_COM = 100 * 1024  # 100 KB
+        
+        if file_size > MAX_SIZE_FOR_COM:
+            logger.info(f"[DocxExtractor] Файл > 100KB ({file_size} байт). Сразу используем zipfile.")
+            return self._extract_via_zip(path, name)
+        # ==========================================
+
+        # Сначала пробуем python-docx с таймаутом (только для маленьких файлов)
         text = self._extract_with_docx(path, name)
         if text:
             return text
