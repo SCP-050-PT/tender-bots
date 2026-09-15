@@ -3,11 +3,11 @@ core/analysis/guard_engine.py
 Guard'ы для валидации и коррекции данных тендера.
 Вынесено из analyzer.py (v6.8.6-r3).
 
-ИСПРАВЛЕНО (v6.9.2):
-- FIX: Guard 4 фантомных students_count теперь проверяет source, не только confidence
-  - Если source == "ktru" — доверять даже при confidence=0
-  - Если source == "llm" и confidence < 0.5 — обнулять
-- Добавлено поле extraction_source в tender_info
+ИСПРАВЛЕНО (v7.8.1):
+- FIX: Guard 5 (Запрещенные направления) теперь учитывает тип тендера.
+  - Если тип 'education', игнорируем общие триггеры ПБ (обучение ПБ - это наш профиль).
+  - Для СОУТ/ОПР/ПЛК проверяем 'пожарная безопасность' только в названии, а не в тексте ТЗ (чтобы не блокировать из-за ссылок на нормы).
+  - Добавлены специфичные триггеры ПБ/Сантехники для проверки в тексте.
 """
 
 from typing import Dict, Any, List, Tuple
@@ -17,14 +17,10 @@ from loguru import logger
 class GuardEngine:
     """
     Применяет guard'ы для исправления противоречивых данных.
-
-    Guard'ы предотвращают ошибки при смешанных типах тендеров
-    (например, СОУТ с students_count или обучение с rm_total).
     """
 
-    VERSION = "v6.9.2"
+    VERSION = "v7.8.1"
 
-    # Пороги
     MAX_STUDENTS_CONFIDENCE = 500
     MIN_CONFIDENCE_THRESHOLD = 0.5
     OPR_RM_THRESHOLD = 200
@@ -32,18 +28,8 @@ class GuardEngine:
     def apply(
         self, tender_info: Dict[str, Any], tender_type: str
     ) -> Tuple[Dict[str, Any], List[str]]:
-        """
-        Применяет guard'ы к данным тендера.
-
-        Args:
-            tender_info: Словарь с параметрами тендера
-            tender_type: Определённый тип тендера
-
-        Returns:
-            (modified_info, guards_triggered)
-        """
         guards = []
-        info = dict(tender_info)  # Копия, чтобы не мутировать оригинал
+        info = dict(tender_info)
 
         # Guard 1: СОУТ/ОПР/ПЛК не имеют слушателей
         if tender_type in ("sout", "opr", "plk"):
@@ -52,7 +38,7 @@ class GuardEngine:
                 info["students_count"] = 0
                 guards.append(f"students_count={old} при типе={tender_type} -> 0")
                 logger.warning(
-                    f"[{self.VERSION}] GUARD: students_count={old} обнулён при {tender_type}"
+                    f"[{self.VERSION}] GUARD: students_count обнулён при {tender_type}"
                 )
 
         # Guard 2: Обучение не имеет рабочих мест
@@ -62,7 +48,7 @@ class GuardEngine:
                 info["rm_total"] = 0
                 guards.append(f"rm_total={old} при типе=education -> 0")
                 logger.warning(
-                    f"[{self.VERSION}] GUARD: rm_total={old} обнулён при education"
+                    f"[{self.VERSION}] GUARD: rm_total обнулён при education"
                 )
 
         # Guard 3: ОПР с rm_total > 200 -> возможно это СОУТ
@@ -76,8 +62,7 @@ class GuardEngine:
                     f"[{self.VERSION}] GUARD: ОПР с {rm} РМ -> проверьте, возможно СОУТ"
                 )
 
-        # Guard 4: Фантомные students_count при низком confidence
-        # v6.9.2 FIX: Проверяем source, не только confidence
+        # Guard 4: Фантомные students_count
         if (
             info.get("students_count")
             and info["students_count"] > self.MAX_STUDENTS_CONFIDENCE
@@ -85,26 +70,23 @@ class GuardEngine:
             source = info.get("students_count_source", "")
             confidence = info.get("extraction_confidence", 0)
 
-            # v6.9.2: Если извлечено из КТРУ — доверять даже при confidence=0
             if source == "ktru":
                 logger.info(
-                    f"[{self.VERSION}] GUARD: students_count={info['students_count']} "
-                    f"из КТРУ (source=ktru) — оставляем"
+                    f"[{self.VERSION}] GUARD: students_count из КТРУ — оставляем"
                 )
             elif confidence < self.MIN_CONFIDENCE_THRESHOLD:
                 old = info["students_count"]
                 info["students_count"] = 0
-                guards.append(
-                    f"students_count={old} фантом (confidence={confidence}, source={source}) -> 0"
-                )
+                guards.append(f"students_count={old} фантом -> 0")
                 logger.warning(
-                    f"[{self.VERSION}] GUARD: Фантомные students_count={old} "
-                    f"при confidence={confidence} (source={source}) -> обнулены"
+                    f"[{self.VERSION}] GUARD: Фантомные students_count обнулены"
                 )
 
-        # Guard 4: Запрещённые направления (не наш профиль)
-        FORBIDDEN_KEYWORDS = [
-            # Поставка СИЗ без услуг (маржа плохая)
+        # Guard 5: Запрещённые направления (умная проверка)
+        # Разделяем ключевые слова на "строгие" (блокируем везде) и "контекстные" (блокируем только в названии или если не обучение)
+
+        # 1. Строгие триггеры (Поставка, Сантехника, Специфичные услуги ПБ) - блокируем всегда, даже в обучении (если это поставка огнетушителей)
+        STRICT_FORBIDDEN = [
             "поставка сиз",
             "поставка средств индивидуальной защиты",
             "поставка спецодежды",
@@ -114,13 +96,21 @@ class GuardEngine:
             "поставка аптечек",
             "поставка огнетушителей",
             "поставка знаков безопасности",
-            # Запрещённые направления из ТЗ Александры
+            "пожарных рукавов",
+            "перекатка пожарных",
+            "пожарных кранов",
+            "внутреннего водопровода",
+            "внутреннего противопожарного",
+            "гидрант",
+            "водоотдача",
+            "испытание пожарных",
+            "проверка работоспособности внутреннего",
+            "монтаж пожарной",
+            "техническое обслуживание пожарной",
             "лицензия мчс",
             "экспертиза промышленной безопасности",
             "обслуживание оборудования",
             "ремонт оборудования",
-            "медицинские работники",
-            "медицинский персонал",
             "информационная безопасность",
             "водительских прав",
             "гражданская оборона",
@@ -132,43 +122,69 @@ class GuardEngine:
             "смывы",
             "яйца гельминтов",
             "биология",
-            # СЗЗ (не наш профиль)
             "сзз",
             "санитарно-защитная зона",
             "проект сзз",
+            "дератизация",
+            "дезинсекция",
+            "дезинфекция",
+        ]
+
+        # 2. Контекстные триггеры (блокируем только если это НЕ обучение и встречается в НАЗВАНИИ)
+        # "пожарная безопасность" в тексте ТЗ по СОУТ - это норма. В названии "Услуги по пожарной безопасности" - это не наш профиль (если не обучение).
+        CONTEXT_FORBIDDEN_TITLE_ONLY = [
+            "пожарная безопасность",
+            "медицинские работники",
+            "медицинский персонал",
         ]
 
         purchase_name = info.get("purchase_name", "").lower()
-        for kw in FORBIDDEN_KEYWORDS:
-            if kw in purchase_name:
-                guards.append(f"Запрещённое направление: '{kw}' в названии")
-                logger.warning(
-                    f"[{self.VERSION}] GUARD: Запрещённое направление '{kw}' → не участвуем"
-                )
-                info["_forbidden_direction"] = True
+        documents_text_lower = info.get("documents_text", "").lower()[:2000]
+
+        is_forbidden = False
+        forbidden_kw_found = ""
+
+        # Проверка строгих триггеров (в названии ИЛИ в тексте)
+        for kw in STRICT_FORBIDDEN:
+            if kw in purchase_name or kw in documents_text_lower:
+                is_forbidden = True
+                forbidden_kw_found = kw
                 break
+
+        # Проверка контекстных триггеров (только в названии, и только если это НЕ обучение)
+        if not is_forbidden and tender_type != "education":
+            for kw in CONTEXT_FORBIDDEN_TITLE_ONLY:
+                if kw in purchase_name:
+                    is_forbidden = True
+                    forbidden_kw_found = kw
+                    break
+
+        if is_forbidden:
+            guards.append(f"Запрещённое направление: '{forbidden_kw_found}'")
+            logger.warning(
+                f"[{self.VERSION}] GUARD: Запрещённое направление '{forbidden_kw_found}' → не участвуем"
+            )
+            info["_forbidden_direction"] = True
+            info["review_reason"] = f"Не профильное направление: {forbidden_kw_found}"
 
         # Guard 6: Признаки договорняка
         SUSPICIOUS_PATTERNS = [
-            # НМЦК совпадает с ценой единственного поставщика
-            # (проверяется в main.py, не здесь)
-            # Слишком короткий срок подачи (< 3 дней для 44-ФЗ)
-            # (проверяется в main.py)
-            # Текст ТЗ содержит конкретное название бренда/модели
             "торговая марка",
             "товарный знак",
             "конкретный производитель",
             "единственный поставщик",
         ]
 
-        purchase_name = info.get("purchase_name", "").lower()
-        documents_text = info.get("documents_text", "").lower()[:5000]
-
+        # Проверяем только текст документов на договорняк
         for pattern in SUSPICIOUS_PATTERNS:
-            if pattern in documents_text:
+            if pattern in documents_text_lower:  # Используем уже обрезанный текст
+                # Исключение: "единственный поставщик" может быть в разделе "Способ определения поставщика" как описание метода,
+                # но если это в требованиях к участнику - плохо. Пока оставим простую проверку, но с логом.
+                # Чтобы избежать ложных срабатываний на описание метода закупки, можно проверить контекст, но пока оставим так.
                 guards.append(f"Подозрение на договорняк: '{pattern}' в ТЗ")
                 logger.warning(
                     f"[{self.VERSION}] GUARD: Подозрение на договорняк — '{pattern}' в ТЗ"
                 )
                 break
+
         return info, guards

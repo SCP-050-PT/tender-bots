@@ -2,10 +2,11 @@
 core/analysis/analyzer.py
 Фасад для анализа тендеров.
 
-v7.5.0:
-  - P0-3: Приоритет КТРУ над hint'ом парсера (students_count > 0 → education)
-  - P1-4: Сохранение fallback-значений в tender_info для передачи в details
-  - Рефакторинг — делегирование сервисам TypeService, LlmService, FallbackService
+v7.7.0:
+  - Принудительная верификация данных через АГЕНТА + MCP для ВСЕХ тендеров
+  - Передача reg_number в LLM для корректной работы инструментов search_documents
+  - Сквозное логирование расхождений между парсером и агентом
+  - Интеграция с agent_thinking логгером
 """
 
 import json
@@ -27,11 +28,14 @@ from core.services.type_service import TypeService
 from core.services.llm_service import LlmService
 from core.services.fallback_service import FallbackService
 
+# Логгер для мышления агента
+agent_logger = logger.bind(type="agent_thinking")
+
 
 class TenderAnalyzer:
-    """Фасад для анализа тендеров. v7.5.0: приоритет КТРУ + сохранение fallback."""
+    """Фасад для анализа тендеров. v7.7.0: обязательная верификация MCP + логирование."""
 
-    VERSION = "v7.5.0"
+    VERSION = "v7.7.0"
 
     # Mapping ЭТП → комиссия (%)
     ETP_COMMISSION_RATES = {
@@ -55,7 +59,6 @@ class TenderAnalyzer:
     ):
         self.calculator = calculator
         self.risk_analyzer = risk_analyzer
-        # v7.0.0: Сервисы вместо дублей
         self.type_service = TypeService()
         self.llm_service = LlmService(llm_client or YandexGPTClient())
         self.fallback_service = FallbackService()
@@ -73,10 +76,11 @@ class TenderAnalyzer:
     ) -> AnalysisResult:
         """Анализирует тендер полностью."""
         logger.info(f"[{self.VERSION}] Начинаю анализ тендера")
+        agent_logger.info(
+            f"🔍 НАЧАЛО АНАЛИЗА ТЕНДЕРА: {tender_info.get('reg_number', 'UNKNOWN')}"
+        )
 
         # === P0-3: ПРИОРИТЕТ КТРУ НАД HINT'ОМ ПАРСЕРА ===
-        # Если КТРУ дал students_count > 0 → это ТОЧНО education,
-        # даже если парсер определил sout/opr/plk
         if tender_info.get("students_count", 0) > 0:
             if tender_type_hint and tender_type_hint != "education":
                 logger.warning(
@@ -84,6 +88,9 @@ class TenderAnalyzer:
                     f"(КТРУ дал {tender_info['students_count']} слушателей)"
                 )
                 tender_type_hint = "education"
+                agent_logger.info(
+                    f"🔄 OVERRIDE ТИПА: {tender_type_hint} → education (КТРУ)"
+                )
         # ==========================================
 
         # Шаг 1: Определение типа (через TypeService)
@@ -94,20 +101,37 @@ class TenderAnalyzer:
             llm_confidence=llm_confidence,
             tender_type_hint=tender_type_hint,
         )
+        agent_logger.info(f"🏷️ ОПРЕДЕЛЕН ТИП: {tender_type} (источник: {type_source})")
 
         # Шаг 2: Guard'ы
         tender_info, guards = self.guard_engine.apply(tender_info, tender_type)
+        if guards:
+            agent_logger.info(f"🛡️ СРАБОТАЛИ GUARD'Ы: {guards}")
+        # Шаг 3: ПРИНУДИТЕЛЬНАЯ ВЕРИФИКАЦИЯ ЧЕРЕЗ АГЕНТА + MCP
+        self._verify_with_agent(tender_info, documents_text, tender_type)
 
-        # Шаг 3: Извлечение параметров через LLM (через LlmService)
-        self._extract_if_needed(tender_info, documents_text, tender_type)
+        # === КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Жесткая блокировка fallback ===
+        if tender_info.get("agent_blocked"):
+            tender_id = tender_info.get(
+                "reg_number", "UNKNOWN_ID"
+            )  # <-- ДОБАВИТЬ ЭТУ СТРОКУ
+            reason = tender_info.get("agent_block_reason", "Неизвестная причина")
 
+            logger.warning(
+                f"[{self.VERSION}] 🚫 АГЕНТ ЗАБЛОКИРОВАЛ ТЕНДЕР {tender_id}. Fallback ОТМЕНЕН."
+            )
+            agent_logger.error(f"❌ Fallback отменен для {tender_id}: {reason}")
+        else:
+            # Шаг 3.5: Fallback-оценки по НМЦК (через FallbackService)
+            logger.info(f"[{self.VERSION}] Запуск fallback-оценок...")
+            self.fallback_service.apply(tender_info, tender_type)
+        # ==========================================
+        # ==========================================
+        # ==========================================
         # Шаг 3.5: Fallback-оценки по НМЦК (через FallbackService)
         self.fallback_service.apply(tender_info, tender_type)
 
         # === P1-4: СОХРАНЕНИЕ FALLBACK В TENDER_INFO ДЛЯ DETAILS ===
-        # FallbackService применяет значения локально, но не сохраняет их
-        # в tender_info с пометкой источника. Делаем это явно здесь,
-        # чтобы _get_quantity() в main.py мог найти их.
         nmck = tender_info.get("nmck", 0)
         if nmck > 0:
             if tender_type == "sout" and not tender_info.get("rm_total"):
@@ -117,7 +141,7 @@ class TenderAnalyzer:
                 logger.info(
                     f"[{self.VERSION}] Fallback СОУТ: {estimated} РМ → сохранено в tender_info"
                 )
-
+                agent_logger.info(f"📉 FALLBACK СОУТ: {estimated} РМ (из НМЦК)")
             elif (
                 tender_type == "plk"
                 and not tender_info.get("measurement_points")
@@ -130,7 +154,7 @@ class TenderAnalyzer:
                 logger.info(
                     f"[{self.VERSION}] Fallback ПЛК: {estimated} точек → сохранено в tender_info"
                 )
-
+                agent_logger.info(f" FALLBACK ПЛК: {estimated} точек (из НМЦК)")
             elif (
                 tender_type == "opr"
                 and not tender_info.get("opr_positions")
@@ -142,7 +166,7 @@ class TenderAnalyzer:
                 logger.info(
                     f"[{self.VERSION}] Fallback ОПР: {estimated} позиций → сохранено в tender_info"
                 )
-
+                agent_logger.info(f"📉 FALLBACK ОПР: {estimated} позиций (из НМЦК)")
             elif tender_type == "education" and not tender_info.get("students_count"):
                 estimated = int(nmck / 1500)
                 tender_info["students_count"] = estimated
@@ -150,11 +174,13 @@ class TenderAnalyzer:
                 logger.info(
                     f"[{self.VERSION}] Fallback Обучение: {estimated} слушателей → сохранено в tender_info"
                 )
+                agent_logger.info(
+                    f" FALLBACK ОБУЧЕНИЕ: {estimated} слушателей (из НМЦК)"
+                )
         # ==========================================
 
-        # Шаг 4: Глобальные затраты (ЭТП, обеспечение, специалист, срочность)
+        # Шаг 4: Глобальные затраты
         deadline_days = tender_info.get("deadline_days", 30)
-
         etp_commission = self._resolve_etp_commission(tender_info)
         app_guarantee = self._parse_guarantee_percent(
             tender_info.get("application_guarantee", "")
@@ -175,8 +201,6 @@ class TenderAnalyzer:
         base_result = self.calculator_router.calculate(
             tender_info, tender_type, documents_text
         )
-
-        # Применяем глобальные затраты К базовой себестоимости
         result = self._apply_extra_costs(base_result, extra_costs)
 
         # Шаг 6: Глобальные лимиты / Guard'ы
@@ -192,6 +216,7 @@ class TenderAnalyzer:
                 f"[{self.VERSION}] GUARD: обнаружены нарушения лимитов: "
                 f"{limits_result['violations']}"
             )
+            agent_logger.warning(f"⚠️ НАРУШЕНИЕ ЛИМИТОВ: {limits_result['violations']}")
             old_price = result.recommended_price
             result = CalculationResult(
                 cost_price=result.cost_price,
@@ -238,7 +263,6 @@ class TenderAnalyzer:
             cost_to_nmck_ratio=limits_result.get("cost_to_nmck_ratio", 0),
         )
 
-        # Если лимиты дали HIGH — не понижаем риск
         limits_risk = limits_result.get("risk_level", "low")
         if limits_risk == "high" and risk_result.get("risk_level") != "high":
             risk_result["risk_level"] = "high"
@@ -249,6 +273,9 @@ class TenderAnalyzer:
                 f"Себестоимость составляет >{max_ratio*100:.0f}% от НМЦК "
                 f"— высокий риск убыточности"
             ]
+            agent_logger.warning(
+                f"🔴 ПОВЫШЕННЫЙ РИСК: cost/NMCK > {max_ratio*100:.0f}%"
+            )
 
         # Шаг 8: Комментарий
         comment = self._build_comment(
@@ -259,6 +286,10 @@ class TenderAnalyzer:
             guards=guards,
             extra_costs=extra_costs,
             limits_result=limits_result,
+        )
+
+        agent_logger.info(
+            f"✅ АНАЛИЗ ЗАВЕРШЕН: тип={tender_type}, решение={risk_result['decision']}"
         )
 
         return AnalysisResult(
@@ -280,60 +311,86 @@ class TenderAnalyzer:
             red_flags=risk_result.get("flags", []),
         )
 
-    # ==================== LLM-извлечение (v7.0.0: делегирует LlmService) ====================
+    # ==================== ВЕРИФИКАЦИЯ ЧЕРЕЗ АГЕНТА (v7.7.0) ====================
 
-    def _extract_if_needed(
+    def _verify_with_agent(
         self, tender_info: Dict[str, Any], documents_text: str, tender_type: str
     ) -> None:
-        """Извлекает параметры через LLM если недостаточно данных."""
-        has_params = self._has_sufficient_params(tender_info, tender_type)
-        if has_params:
-            logger.info(
-                f"[{self.VERSION}] Параметров достаточно, LLM-извлечение не требуется"
+        """
+        v7.7.0: Принудительная верификация данных через АГЕНТА + MCP.
+        Вызывается для КАЖДОГО тендера. Передает reg_number для работы инструментов.
+        """
+        tender_id = tender_info.get("reg_number", "UNKNOWN_ID")
+
+        parser_context = {
+            "tender_id": tender_id,
+            "nmck": tender_info.get("nmck", 0),
+            "parsed_rm": tender_info.get("rm_total"),
+            "parsed_opr_positions": tender_info.get("opr_positions"),
+            "parsed_plk_points": tender_info.get("measurement_points"),
+            "parsed_students": tender_info.get("students_count"),
+            "detected_type": tender_type,
+            "raw_text_length": len(documents_text),
+        }
+
+        logger.info(
+            f"[{self.VERSION}] Запуск агента для ВЕРИФИКАЦИИ тендера {tender_id}..."
+        )
+        agent_logger.info(f" ЗАПУСК ВЕРИФИКАЦИИ АГЕНТОМ: {tender_id}")
+
+        extracted = self.llm_service.extract_params(
+            tender_type=tender_type,
+            documents_text=documents_text,
+            tender_id=tender_id,
+            context_override=json.dumps(parser_context, ensure_ascii=False),
+        )
+
+        # === НОВОЕ: Обработка осознанного отказа агента ===
+        if extracted and extracted.get("blocked_by_error"):
+            reason = extracted.get("reason", "Ошибка анализа")
+            logger.warning(
+                f"[{self.VERSION}] Агент отказался анализировать {tender_id}: {reason}"
             )
+            agent_logger.warning(f"🚫 ОТКАЗ АГЕНТА: {reason}")
+
+            # Помечаем тендер как проблемный, чтобы не применять fallback
+            tender_info["agent_blocked"] = True
+            tender_info["agent_block_reason"] = reason
+            return
+        # ==========================================
+
+        if not extracted:
+            logger.warning(
+                f"[{self.VERSION}] Агент не вернул верифицированные данные для {tender_id}"
+            )
+            agent_logger.warning(f" АГЕНТ НЕ ВЕРНУЛ ДАННЫЕ ДЛЯ {tender_id}")
             return
 
-        extracted = self.llm_service.extract_params(tender_type, documents_text)
-        if not extracted:
-            return
+        # Логирование сравнения данных
+        agent_logger.info(f"🔄 СРАВНЕНИЕ ДАННЫХ ПАРСЕРА И АГЕНТА ДЛЯ {tender_id}:")
 
         for key, value in extracted.items():
-            if value is not None and tender_info.get(key) is None:
+            if value is not None:
+                old_val = tender_info.get(key)
                 tender_info[key] = value
-                logger.info(f"[{self.VERSION}] Извлечено: {key}={value}")
 
-    def _has_sufficient_params(self, info: Dict[str, Any], tender_type: str) -> bool:
-        """Проверяет, достаточно ли параметров для расчёта."""
-        if tender_type == "sout":
-            return bool(info.get("rm_total") and info["rm_total"] > 0)
-        elif tender_type == "education":
-            has_scalar = bool(info.get("students_count") and info["students_count"] > 0)
-            has_programs = bool(info.get("programs") and len(info["programs"]) > 0)
-            return has_scalar or has_programs
-        elif tender_type == "opr":
-            has_opr = bool(info.get("opr_positions") and info["opr_positions"] > 0)
-            has_rm = bool(info.get("rm_total") and info["rm_total"] > 0)
-            has_persons = bool(info.get("opr_persons") and info["opr_persons"] > 0)
-            if has_persons and not has_opr:
-                info["opr_positions"] = info["opr_persons"]
-                has_opr = True
-                logger.info(
-                    f"[{self.VERSION}] Fallback: opr_persons="
-                    f"{info['opr_persons']} → opr_positions"
-                )
-            return has_opr or has_rm
-        elif tender_type == "plk":
-            return bool(
-                info.get("measurement_points") and info["measurement_points"] > 0
-            )
-        return False
+                if old_val != value and old_val is not None:
+                    logger.warning(
+                        f"[{self.VERSION}] ️ РАСХОЖДЕНИЕ в {tender_id}: {key} изменено с {old_val} на {value} "
+                        f"(по результатам проверки агентом/MCP)"
+                    )
+                    agent_logger.warning(f"⚠️ РАСХОЖДЕНИЕ: {key} {old_val} → {value}")
+                else:
+                    logger.info(
+                        f"[{self.VERSION}] ✅ Подтверждено агентом: {key}={value}"
+                    )
+                    agent_logger.info(f"✅ ПОДТВЕРЖДЕНО: {key}={value}")
 
     # ==================== Утилиты для guard'ов ====================
 
     def _merge_review_reasons(
         self, existing: str, limits_reason: str, violations: List[str]
     ) -> str:
-        """Объединяет причины ручной проверки."""
         parts = []
         if existing:
             parts.append(existing)
@@ -343,10 +400,7 @@ class TenderAnalyzer:
             parts.append("Нарушения лимитов: " + "; ".join(violations))
         return " | ".join(parts) if parts else ""
 
-    # ==================== ЭТП и обеспечение ====================
-
     def _resolve_etp_commission(self, tender_info: Dict[str, Any]) -> float:
-        """Определяет комиссию ЭТП."""
         etp = tender_info.get("etp_commission_percent", 0)
         if etp > 0:
             return etp
@@ -362,7 +416,6 @@ class TenderAnalyzer:
         return 0.0
 
     def _parse_guarantee_percent(self, guarantee_raw: str) -> float:
-        """Парсит процент обеспечения из строки."""
         if not guarantee_raw:
             return 0.0
         text = str(guarantee_raw).lower()
@@ -376,7 +429,6 @@ class TenderAnalyzer:
     def _apply_extra_costs(
         self, base_result: CalculationResult, extra_costs: dict
     ) -> CalculationResult:
-        """Добавляет глобальные затраты к БАЗОВОЙ себестоимости."""
         total_extra = extra_costs.get("total_extra", 0)
 
         if base_result.cost_price <= 0:
@@ -419,8 +471,6 @@ class TenderAnalyzer:
             details=details,
         )
 
-    # ==================== Комментарий ====================
-
     def _build_comment(
         self,
         tender_type: str,
@@ -431,7 +481,6 @@ class TenderAnalyzer:
         extra_costs: dict = None,
         limits_result: dict = None,
     ) -> str:
-        """Строит детальный комментарий к результату анализа."""
         lines = [
             f"Анализ тендера типа «{tender_type}»",
             "",
@@ -497,6 +546,6 @@ class TenderAnalyzer:
 
         if result.review_reason:
             lines.append("")
-            lines.append(f"⚠️ {result.review_reason}")
+            lines.append(f"️ {result.review_reason}")
 
         return "\n".join(lines)

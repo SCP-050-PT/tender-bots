@@ -147,6 +147,14 @@ class TypeService:
             "проверка знаний требований охраны труда",
             "проверка знаний по охране труда",
         ],
+        # В TypeService.TITLE_KEYWORDS добавить:
+        "combined": [
+            "комплекс работ",
+            "мероприятия по улучшению условий труда",
+            "соут и производственный контроль",
+            "соут и плк",
+            "оценка условий труда и производственный контроль",
+        ],
     }
 
     # === ЕДИНСТВЕННЫЙ источник алиасов ===
@@ -187,110 +195,121 @@ class TypeService:
     ) -> Tuple[str, str, str]:
         """
         Каскадное определение типа тендера.
-
-        Returns:
-            (type, source, method)
+        Приоритет: Название (Title) > Жесткие правила > Хинт парсера > Текст > LLM > КТРУ.
         """
-        # Шаг 1: hint из detailed_parser
+        purchase_name = tender_info.get("purchase_name", "").lower()
+        doc_text_lower = documents_text.lower() if documents_text else ""
+
+        # === ШАГ 0: Жесткий приоритет Обучения (Расширенный) ===
+        # Проверяем название И начало текста на явные маркеры обучения
+        education_markers_title = [
+            "обучение", "подготовка кадров", "образовательных услуг", 
+            "повышение квалификации", "переподготовка", "курсы"
+        ]
+        education_markers_text = [
+            "слушателей", "учебный план", "программа обучения", 
+            "удостоверение", "диплом", "проверка знаний"
+        ]
+        
+        is_education_title = any(kw in purchase_name for kw in education_markers_title)
+        is_education_text = any(kw in doc_text_lower[:2000] for kw in education_markers_text) #只看前2000字符
+
+        # Если это явно обучение (по названию или тексту), и это НЕ чистый СОУТ/ПЛК/ОПР лот
+        if is_education_title or (is_education_text and "обучение" in doc_text_lower[:500]):
+            # Исключения: если в названии явно указано другое
+            if not any(kw in purchase_name for kw in ["специальная оценка", "соут", "производственный контроль", "оценка профессиональных рисков"]):
+                logger.info(f"[{self.VERSION}] HARD RULE: Маркеры обучения найдены -> Education")
+                return "education", "hard_rule_education", "heuristic"
+
+        # === ШАГ 1: Проверка TITLE (Приоритет над Hint!) ===
+        if purchase_name:
+            # 1.1 Проверяем Combined в названии
+            if "combined" in self.TITLE_KEYWORDS:
+                for kw in self.TITLE_KEYWORDS["combined"]:
+                    if kw in purchase_name:
+                        logger.info(f"[{self.VERSION}] Тип из title: combined ('{purchase_name[:60]}...')")
+                        return "combined", "title_heuristic", "heuristic"
+
+            # 1.2 Проверяем остальные типы в названии
+            for ttype, keywords in self.TITLE_KEYWORDS.items():
+                if ttype == "combined": continue
+                if any(kw in purchase_name for kw in keywords):
+                    logger.info(f"[{self.VERSION}] Тип из title: {ttype} ('{purchase_name[:60]}...')")
+                    return ttype, "title_heuristic", "heuristic"
+
+        # === ШАГ 2: Hint из detailed_parser ===
         if tender_type_hint:
             normalized = self.normalize(tender_type_hint)
+            # Защита: если хинт 'opr', но в названии/тексте явное обучение -> education
+            if normalized == "opr" and (is_education_title or is_education_text):
+                 logger.warning(f"[{self.VERSION}] Конфликт: Hint=OPR, но найдены маркеры обучения -> Education")
+                 return "education", "hint_override_education", "heuristic"
+            
+            # Защита: если хинт 'opr', но в названии есть 'лабораторные' -> plk
+            if normalized == "opr" and any(kw in purchase_name for kw in ["лабораторн", "испытан", "замер"]):
+                 logger.warning(f"[{self.VERSION}] Конфликт: Hint=OPR, но в названии лаборатория -> PLK")
+                 return "plk", "hint_override_title", "heuristic"
+            
             logger.info(f"[{self.VERSION}] Тип из detailed_parser hint: {normalized}")
             return normalized, "detailed_parser_hint", "hint"
 
-        # Шаг 1.5: Проверка title (приоритет над КТРУ)
-        purchase_name = tender_info.get("purchase_name", "")
-        if purchase_name:
-            name_lower = purchase_name.lower()
-            for ttype, keywords in self.TITLE_KEYWORDS.items():
-                if any(kw in name_lower for kw in keywords):
-                    logger.info(
-                        f"[{self.VERSION}] Тип из title: {ttype} ('{purchase_name[:60]}...')"
-                    )
-                    return ttype, "title_heuristic", "heuristic"
-        # === v7.3.1: Проверка на комбо-тендер по тексту ===
-        text_lower = documents_text.lower() if documents_text else ""
-        has_sout_kw = any(
-            kw in text_lower
-            for kw in ["специальная оценка", "соут", "оценка условий труда"]
-        )
-        has_opr_kw = any(
-            kw in text_lower
-            for kw in [
-                "оценка профессиональных рисков",
-                "опр",
-                "профессиональных рисков",
-            ]
-        )
-        has_plk_kw = any(
-            kw in text_lower
-            for kw in [
-                "производственный контроль",
-                "плк",
-                "лабораторные исследования",
-                "замеры",
-            ]
-        )
+        # === ШАГ 3: Проверка на комбо-тендер по ТЕКСТУ ===
+        has_sout_kw = any(kw in doc_text_lower for kw in ["специальная оценка", "соут", "оценка условий труда"])
+        has_opr_kw = any(kw in doc_text_lower for kw in ["оценка профессиональных рисков", "опр", "профессиональных рисков"])
+        has_plk_kw = any(kw in doc_text_lower for kw in ["производственный контроль", "плк", "лабораторные исследования", "замеры"])
 
         combo_count = sum([has_sout_kw, has_opr_kw, has_plk_kw])
         if combo_count >= 2:
-            logger.info(f"[{self.VERSION}] Обнаружен комбо-тендер ({combo_count} типа)")
+            logger.info(f"[{self.VERSION}] Обнаружен комбо-тендер по тексту ({combo_count} типа)")
             return "combined", "text_heuristic_combo", "heuristic"
 
-        # === v7.3.1: Защита от ложного ОПР (лаборатория) ===
-        if tender_type_hint == "opr" and any(
-            kw in text_lower
-            for kw in [
-                "лабораторные исследования",
-                "испытания проб",
-                "сточной воды",
-                "атмосферного воздуха",
-                "санитарно-эпидемиологических",
-            ]
-        ):
-            logger.warning(
-                f"[{self.VERSION}] Ложный ОПР: обнаружены признаки лаборатории. Меняю на plk/testing"
-            )
-            tender_type_hint = "plk"  # или testing
+        # === ШАГ 4: Защита от ложного ОПР (лаборатория/обучение) по тексту ===
+        if tender_type_hint == "opr":
+            if any(kw in doc_text_lower for kw in ["лабораторные исследования", "испытания проб", "сточной воды"]):
+                logger.warning(f"[{self.VERSION}] Ложный ОПР: признаки лаборатории -> PLK")
+                return "plk", "text_guard_opr", "heuristic"
+            
+            # Если в тексте много про обучение, а хинт ОПР - это ошибка
+            if doc_text_lower.count("обучение") > 2 and doc_text_lower.count("слушател") > 0:
+                logger.warning(f"[{self.VERSION}] Ложный ОПР: признаки обучения -> Education")
+                return "education", "text_guard_opr_edu", "heuristic"
 
-        # Шаг 2: LLM классификация (высокий confidence)
+        # === ШАГ 5: LLM классификация ===
         if llm_classification and llm_confidence >= 0.7:
             normalized = self.normalize(llm_classification)
             logger.info(f"[{self.VERSION}] Тип из LLM классификации: {normalized}")
             return normalized, "llm_classification", "classify"
 
-        # Шаг 3: КТРУ-данные
+        # === ШАГ 6: КТРУ-данные ===
         has_rm = bool(tender_info.get("rm_total") and tender_info["rm_total"] > 0)
-        has_students = bool(
-            tender_info.get("students_count") and tender_info["students_count"] > 0
-        )
+        has_students = bool(tender_info.get("students_count") and tender_info["students_count"] > 0)
+        has_points = bool(tender_info.get("points_count") and tender_info["points_count"] > 0)
 
-        if has_rm and has_students:
-            logger.info(f"[{self.VERSION}] Тип из КТРУ: combined (РМ + слушатели)")
-            return "combined", "ktru", "data"
+        if (has_rm and has_points) or (has_rm and has_students):
+             logger.info(f"[{self.VERSION}] Тип из КТРУ: combined (данные)")
+             return "combined", "ktru", "data"
+        
         if has_rm:
-            logger.info(
-                f"[{self.VERSION}] Тип из КТРУ: sout ({tender_info['rm_total']} РМ)"
-            )
+            logger.info(f"[{self.VERSION}] Тип из КТРУ: sout ({tender_info['rm_total']} РМ)")
             return "sout", "ktru", "data"
+        if has_points:
+             logger.info(f"[{self.VERSION}] Тип из КТРУ: plk ({tender_info['points_count']} точек)")
+             return "plk", "ktru", "data"
         if has_students:
-            logger.info(
-                f"[{self.VERSION}] Тип из КТРУ: education ({tender_info['students_count']} слушателей)"
-            )
+            logger.info(f"[{self.VERSION}] Тип из КТРУ: education ({tender_info['students_count']} слушателей)")
             return "education", "ktru", "data"
 
-        # Шаг 4: Эвристика по тексту документов
-        text_lower = documents_text.lower()
+        # === ШАГ 7: Эвристика по тексту документов ===
         for ttype, keywords in self.KEYWORDS.items():
-            if any(kw in text_lower for kw in keywords):
-                if ttype == "education" and (
-                    "охрана труда" in text_lower or "охране труда" in text_lower
-                ):
+            if any(kw in doc_text_lower for kw in keywords):
+                if ttype == "education" and ("охрана труда" in doc_text_lower or "охране труда" in doc_text_lower):
                     logger.info(f"[{self.VERSION}] Тип из текста: education (ОТ)")
                     return "education", "text_heuristic", "heuristic"
+                
                 logger.info(f"[{self.VERSION}] Тип из текста: {ttype}")
                 return ttype, "text_heuristic", "heuristic"
 
-        # Шаг 5: Fallback
+        # === ШАГ 8: Fallback ===
         logger.warning(f"[{self.VERSION}] Тип не определён, будет ручная проверка")
         return "unknown", "fallback", "none"
 

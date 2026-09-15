@@ -1,11 +1,9 @@
 """
 core/http_session.py
 Единая HTTP-сессия на базе curl_cffi.
-ИСПРАВЛЕНО (v6.8.6):
-  - _update_headers → update_session_headers (публичный)
-  - _update_session_headers → псевдоним для обратной совместимости
+v6.8.7: Увеличены таймауты, добавлены мягкие задержки и улучшена совместимость с zakupki.gov.ru
 """
-
+import string
 import random
 import time
 from typing import Optional, List, Any
@@ -52,12 +50,17 @@ def get_platform_from_ua(user_agent: str) -> str:
 class HTTPSessionManager:
     """
     Единый менеджер HTTP-сессий.
-    Заменяет: пул сессий в searcher.py, дублирование в detailed_parser.py.
+    v6.8.7: Мягкие задержки, увеличенные таймауты, лучшая совместимость с zakupki
     """
 
     DEFAULT_POOL_SIZE = 3
-    REQUEST_DELAY = (0.5, 1.5)
-    BACKOFF_BASE = 5
+    REQUEST_DELAY = (1.0, 2.5)  # УВЕЛИЧЕНЫ задержки для "мягкости"
+    BACKOFF_BASE = 10  # УВЕЛИЧЕН базовый backoff
+
+    # НОВЫЕ НАСТРОЙКИ ТАЙМАУТОВ
+    CONNECT_TIMEOUT = 15  # Время на установление соединения
+    READ_TIMEOUT = 90  # Время на чтение ответа (для больших файлов)
+    TOTAL_TIMEOUT = 120  # Общее время запроса
 
     def __init__(self, pool_size: int = 3, proxy: Optional[str] = None):
         self.pool_size = pool_size
@@ -68,7 +71,8 @@ class HTTPSessionManager:
 
         self._init_pool()
         logger.info(
-            f"HTTPSessionManager: {pool_size} сессий (curl_cffi={HAS_CURL_CFFI})"
+            f"HTTPSessionManager: {pool_size} сессий (curl_cffi={HAS_CURL_CFFI}, "
+            f"таймауты: connect={self.CONNECT_TIMEOUT}s, read={self.READ_TIMEOUT}s)"
         )
 
     def _init_pool(self):
@@ -78,13 +82,34 @@ class HTTPSessionManager:
             self._sessions.append(session)
 
     def _create_session(self) -> Any:
-        """Создаёт одну сессию."""
+        """Создаёт одну сессию с оптимизированными настройками."""
         user_agent = get_random_user_agent()
         platform = get_platform_from_ua(user_agent)
 
         try:
             if HAS_CURL_CFFI:
+                # Используем chrome124 как наиболее стабильный для российских сайтов
                 session = curl_requests.Session(impersonate="chrome124")
+
+                # БЕЗОПАСНАЯ НАСТРОЙКА CURL (работает на всех версиях)
+                try:
+                    # Пробуем новый способ доступа (v0.7+)
+                    if hasattr(curl_requests, 'CurlOpt'):
+                        session.curl.setopt(curl_requests.CurlOpt.HTTP_VERSION, 
+                                           curl_requests.CurlHttpVersion.V1_1)
+                        session.curl.setopt(curl_requests.CurlOpt.TCP_KEEPALIVE, 1)
+                        session.curl.setopt(curl_requests.CurlOpt.TCP_KEEPIDLE, 60)
+                        session.curl.setopt(curl_requests.CurlOpt.TCP_KEEPINTVL, 30)
+                    else:
+                        # Старый способ (v0.5-v0.6)
+                        from curl_cffi import CurlOpt, CurlHttpVersion
+                        session.curl.setopt(CurlOpt.HTTP_VERSION, CurlHttpVersion.V1_1)
+                        session.curl.setopt(CurlOpt.TCP_KEEPALIVE, 1)
+                        session.curl.setopt(CurlOpt.TCP_KEEPIDLE, 60)
+                        session.curl.setopt(CurlOpt.TCP_KEEPINTVL, 30)
+                except Exception as e:
+                    logger.debug(f"Не удалось настроить curl options: {e}. Используем дефолтные.")
+
             else:
                 session = curl_requests.Session()
 
@@ -96,6 +121,11 @@ class HTTPSessionManager:
             session = curl_requests.Session()
 
         self.update_session_headers(session, user_agent, platform)
+        session.cookies.set("EPZ_USER_LANG", "ru_RU", domain=".zakupki.gov.ru")
+        session.cookies.set("_ym_uid", str(random.randint(1000000000, 9999999999)), domain=".zakupki.gov.ru")
+        session.cookies.set("_ym_d", time.strftime("%Y%m%d"), domain=".zakupki.gov.ru")
+        session.cookies.set("JSESSIONID", "".join(random.choices(string.ascii_uppercase + string.digits, k=32)), domain=".zakupki.gov.ru")
+
         session.verify = False
         return session
 
@@ -149,7 +179,7 @@ class HTTPSessionManager:
         if self._consecutive_429 > 0:
             delay = self._base_delay * (2 ** (self._consecutive_429 - 1))
             delay = min(delay, 300)
-            logger.warning(f"⏳ Backoff: {delay}с (429 x{self._consecutive_429})")
+            logger.warning(f" Backoff: {delay}с (429 x{self._consecutive_429})")
             return delay
         return random.uniform(*self.REQUEST_DELAY)
 
@@ -171,22 +201,34 @@ class HTTPSessionManager:
         self,
         url: str,
         session_index: int = 0,
-        timeout: int = 30,
+        timeout: int = None,  # Теперь можно переопределять глобальный таймаут
         max_retries: int = 3,
         headers: dict = None,
         allow_redirects: bool = True,
     ) -> Optional[Any]:
         session = self.get_session(session_index)
-        for attempt in range(max_retries):
 
+        # Используем переданный таймаут или глобальные настройки
+        effective_timeout = timeout or self.TOTAL_TIMEOUT
+
+        for attempt in range(max_retries):
             delay = self.calculate_delay()
             if attempt > 0:
-                logger.info(f"  ⏳ Попытка {attempt + 1}, задержка {delay:.1f}с...")
+                logger.info(
+                    f"  ⏳ Попытка {attempt + 1}/{max_retries}, задержка {delay:.1f}с..."
+                )
             time.sleep(delay)
 
             try:
                 request_headers = headers or {}
-                response = session.get(url, timeout=timeout, headers=request_headers)
+
+                # ИСПОЛЬЗУЕМ КОРТЕЖ ТАЙМАУТОВ (connect, read)
+                response = session.get(
+                    url,
+                    timeout=(self.CONNECT_TIMEOUT, effective_timeout),
+                    headers=request_headers,
+                    allow_redirects=allow_redirects,
+                )
 
                 if response.status_code == 429:
                     self.handle_429()
@@ -196,11 +238,17 @@ class HTTPSessionManager:
                     self.reset_429_counter()
                     return response
 
-                logger.warning(f"  ⚠️ Статус {response.status_code}")
+                logger.warning(f"  ⚠️ Статус {response.status_code}: {url[:100]}...")
 
             except Exception as e:
-                logger.error(f"  ❌ Ошибка запроса: {e}")
-                time.sleep(5)
+                error_type = type(e).__name__
+                logger.error(f"  ❌ Ошибка запроса ({error_type}): {str(e)[:200]}")
+
+                # Для таймаутов делаем дополнительную паузу
+                if "timeout" in str(e).lower() or "timed out" in str(e).lower():
+                    time.sleep(10)
+                else:
+                    time.sleep(5)
 
         return None
 
@@ -234,7 +282,7 @@ def get_session(index: int = 0) -> Any:
 
 
 def make_request(
-    url: str, timeout: int = 30, max_retries: int = 3, headers: dict = None
+    url: str, timeout: int = None, max_retries: int = 3, headers: dict = None
 ) -> Optional[Any]:
     """Удобная функция для выполнения запроса."""
     return get_session_manager().make_request(

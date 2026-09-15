@@ -1,12 +1,16 @@
 """
 utils/llm_client.py
 Клиент для YandexGPT и AI Studio Agents через Responses API.
+v7.7.1: Исправлены пустые ответы агента (убрана обрезка input).
 """
 
 import json
 import re
 from typing import Optional
 from loguru import logger
+
+# Создаем отдельный логгер для "мышления" агента
+agent_logger = logger.bind(type="agent_thinking")
 
 try:
     import openai
@@ -64,69 +68,226 @@ class YandexGPTClient:
 
         mode_name = "МОДЕЛЬ"
 
-        # === РЕЖИМ АГЕНТА ЧЕРЕZ RESPONSES API ===
+        # === РЕЖИМ АГЕНТА ЧЕРЕЗ ПРЯМОЙ HTTP-ЗАПРОС К RESPONSES API ===
         if self.use_agent:
-            try:
-                mode_name = "АГЕНТ (Responses API)"
-                logger.info(f"Запрос к Yandex ({mode_name})")
+            import requests as req_lib
+            import time
 
-                # Создаем клиент OpenAI для Yandex Cloud
-                client = openai.OpenAI(
-                    api_key=self.agent_api_key,
-                    base_url=self.AGENT_BASE_URL,
-                    project=self.folder_id,  # Это folder_id в терминологии Yandex
-                )
+            mode_name = "АГЕНТ (Responses API)"
+            agent_uri = f"gpt://{self.folder_id}/{self.agent_id}/latest"
+            url = "https://ai.api.cloud.yandex.net/v1/responses"
+            headers = {
+                "Authorization": f"Api-Key {self.agent_api_key}",
+                "Content-Type": "application/json",
+                "x-folder-id": self.folder_id,
+            }
 
-                # Вызываем агента через Responses API
-                response = client.responses.create(
-                    prompt={
-                        "id": self.agent_id,
-                    },
-                    input=user_message,
-                    # Параметры температуры и токенов берутся из настроек агента в AI Studio
-                )
+            payload = {
+                "input": user_message,
+                "prompt": {"id": self.agent_id},
+                "temperature": temperature,
+                "max_output_tokens": max_tokens,
+            }
 
-                text = response.output_text
-                logger.info(f" ПОЛНЫЙ ОТВЕТ АГЕНТА:\n{text[:1000]}...")
+            log_payload = dict(payload)
+            if len(user_message) > 500:
+                log_payload["input"] = user_message[:500] + "..."
+            agent_logger.debug(
+                f"📤 ЗАПРОС К АГЕНТУ:\n{json.dumps(log_payload, ensure_ascii=False, indent=2)}"
+            )
 
-                if text:
+            # === v7.8.0: RETRY ЛОГИКА ДЛЯ АГЕНТА ===
+            agent_retries = 3
+            for attempt in range(1, agent_retries + 1):
+                try:
+                    logger.info(
+                        f"Запрос к Yandex ({mode_name}) ID: {self.agent_id} (попытка {attempt}/{agent_retries})"
+                    )
+                    logger.info(f"Вызов агента с prompt.id: {self.agent_id}")
+
+                    response = req_lib.post(
+                        url, headers=headers, json=payload, timeout=self.timeout
+                    )
+                    response.raise_for_status()
+                    result = response.json()
+
+                    # Парсим ответ от Responses API
+                    text = ""
+                    if "output" in result:
+                        for item in result.get("output", []):
+                            if item.get("type") == "message":
+                                for content in item.get("content", []):
+                                    if content.get("type") == "output_text":
+                                        text += content.get("text", "")
+                    elif "result" in result:
+                        text = (
+                            result.get("result", {})
+                            .get("alternatives", [{}])[0]
+                            .get("message", {})
+                            .get("text", "")
+                        )
+
+                    agent_logger.debug(f"📥 СЫРОЙ ОТВЕТ АГЕНТА:\n{text}")
+                    logger.info(f" ПОЛНЫЙ ОТВЕТ АГЕНТА:\n{text[:1000]}...")
+
+                    # === v7.8.0: Если ответ пустой — пробуем снова ===
+                    if not text or len(text.strip()) < 5:
+                        logger.warning(
+                            f"[{mode_name}] Пустой ответ (попытка {attempt}/{agent_retries})"
+                        )
+                        agent_logger.warning(f"⚠️ ПУСТОЙ ОТВЕТ (попытка {attempt})")
+                        if attempt < agent_retries:
+                            time.sleep(2 * attempt)
+                            continue
+                        else:
+                            logger.error(
+                                "❌ ПУСТОЙ ОТВЕТ ОТ АГЕНТА (все попытки исчерпаны)"
+                            )
+                            agent_logger.error(
+                                "❌ ПУСТОЙ ОТВЕТ ОТ АГЕНТА (все попытки исчерпаны)"
+                            )
+                            return None
+                    # ==========================================
+
                     parsed = self._extract_json(text)
 
-                    # === ПРОВЕРКА НА БЛОКИРОВКУ ОТ АГЕНТА ===
+                    # Обработка осознанных ошибок агента
+                    if parsed and parsed.get("error") == "true":
+                        reason = parsed.get("reason", "Неизвестная ошибка")
+                        suggestion = parsed.get("suggestion", "")
+                        logger.warning(f"⚠️ Агент ОТКАЗАЛСЯ анализировать: {reason}")
+                        agent_logger.error(f"❌ ОШИБКА АГЕНТА: {reason}")
+                        if suggestion:
+                            agent_logger.info(f"💡 СОВЕТ АГЕНТА: {suggestion}")
+                        return {
+                            "blocked_by_error": True,
+                            "reason": reason,
+                            "suggestion": suggestion,
+                        }
+
+                    # Логирование мыслительного процесса
+                    if parsed:
+                        agent_logger.info(f" МЫСЛИ АГЕНТА:")
+                        agent_logger.info(
+                            f"   Уверенность: {parsed.get('confidence', 'N/A')}"
+                        )
+                        agent_logger.info(
+                            f"   Решение: {parsed.get('decision', parsed.get('recommendation', 'N/A'))}"
+                        )
+                        params = {
+                            k: v
+                            for k, v in parsed.items()
+                            if k
+                            not in [
+                                "reason",
+                                "confidence",
+                                "decision",
+                                "recommendation",
+                                "blocked_by_agent",
+                            ]
+                        }
+                        agent_logger.info(
+                            f"   Извлеченные параметры: {json.dumps(params, ensure_ascii=False, indent=4)}"
+                        )
+
+                    # Проверка на блокировку от агента
                     if parsed and parsed.get("decision") == "не рекомендуется":
-                        logger.warning(f"🛑 АГЕНТ ЗАБЛОКИРОВАЛ ТЕНДЕР: {parsed.get('reason')}")
+                        logger.warning(
+                            f"🛑 АГЕНТ ЗАБЛОКИРОВАЛ ТЕНДЕР: {parsed.get('reason')}"
+                        )
+                        agent_logger.warning(f"🚫 БЛОКИРОВКА: {parsed.get('reason')}")
                         return {
                             "decision": "не рекомендуется",
                             "reason": parsed.get("reason"),
                             "confidence": 1.0,
-                            "blocked_by_agent": True
+                            "blocked_by_agent": True,
                         }
-                    # ==========================================
-                    # === НОВОЕ: Маркировка ненадежных данных ===
+
+                    # Маркировка ненадежных данных
                     if parsed and parsed.get("confidence", 0) < 0.5:
                         logger.warning(
-                            f"⚠️ Низкая уверенность агента ({parsed.get('confidence')}). Помечаю для fallback."
+                            f"️ Низкая уверенность агента ({parsed.get('confidence')}). Помечаю для fallback."
                         )
                         parsed["llm_unreliable"] = True
+                        agent_logger.warning(
+                            f"⚠️ НИЗКАЯ УВЕРЕННОСТЬ: {parsed.get('confidence')}"
+                        )
 
                     if parsed:
                         logger.info("Ответ получен от АГЕНТ, извлекаю JSON...")
                         return parsed
                     else:
-                        return {"raw_text": text, "parse_error": True}
+                        # JSON не распарсился — возможно, модель вернула мусор. Пробуем снова.
+                        logger.warning(
+                            f"[{mode_name}] Не удалось распарсить JSON (попытка {attempt}/{agent_retries}): {text[:200]}"
+                        )
+                        if attempt < agent_retries:
+                            time.sleep(2 * attempt)
+                            continue
+                        else:
+                            return {"raw_text": text, "parse_error": True}
 
-                else:
-                    logger.error("Пустой ответ от агента")
-                    return None
+                except req_lib.exceptions.Timeout:
+                    logger.warning(
+                        f"[{mode_name}] Таймаут (попытка {attempt}/{agent_retries})"
+                    )
+                    agent_logger.warning(f"⏰ ТАЙМАУТ (попытка {attempt})")
+                    if attempt < agent_retries:
+                        time.sleep(2 * attempt)
+                        continue
+                    else:
+                        logger.error(f"[{mode_name}] Все попытки исчерпаны (таймаут)")
+                        return None
 
-            except Exception as e:
-                logger.error(f"Ошибка вызова агента: {e}")
-                logger.warning("⚠️ Агент недоступен. Переключаюсь на обычную модель.")
-                # Автоматический fallback на обычную модель
-                self.use_agent = False
-                # Продолжаем выполнение ниже с обычной моделью
+                except req_lib.exceptions.HTTPError as e:
+                    error_msg = str(e)
+                    logger.error(f"HTTP ошибка агента: {e}")
+                    agent_logger.error(f"❌ HTTP ОШИБКА: {error_msg}")
 
-        # === РЕЖИМ ОБЫЧНОЙ МОДЕЛИ (или FALLBACK) ===
+                    if "403" in error_msg or "Forbidden" in error_msg:
+                        logger.error(
+                            "❌ Ошибка 403: API-ключ не имеет прав на вызов агентов."
+                        )
+                        logger.error(
+                            "💡 Решение: Создайте новый API-ключ для SA с полными правами на AI Studio."
+                        )
+                        self.use_agent = False
+                        break  # Выходим из цикла retry, переключаемся на модель
+                    elif "400" in error_msg or "Bad Request" in error_msg:
+                        logger.error("❌ Ошибка 400: Проверьте ID агента и Folder ID.")
+                        self.use_agent = False
+                        break
+                    elif "429" in error_msg:
+                        logger.warning(
+                            f"[{mode_name}] Rate limit (429), ждем 10 сек..."
+                        )
+                        if attempt < agent_retries:
+                            time.sleep(10)
+                            continue
+                        else:
+                            return None
+                    else:
+                        if attempt < agent_retries:
+                            time.sleep(2 * attempt)
+                            continue
+                        else:
+                            return None
+
+                except Exception as e:
+                    error_msg = str(e)
+                    logger.error(f"Ошибка вызова агента: {e}")
+                    agent_logger.error(f"❌ ОШИБКА ВЫЗОВА АГЕНТА: {error_msg}")
+                    if attempt < agent_retries:
+                        time.sleep(2 * attempt)
+                        continue
+                    else:
+                        logger.warning(
+                            "⚠️ Агент недоступен после всех попыток. Переключаюсь на обычную модель."
+                        )
+                        self.use_agent = False
+                        break
+            # === КОНЕЦ RETRY ЦИКЛА ===
+        # === РЕЖИМ ОБЫЧНОЙ МОДЕЛИ (FALLBACK) ===
         if not self.use_agent:
             mode_name = "МОДЕЛЬ (FALLBACK)" if hasattr(self, "_was_agent") else "МОДЕЛЬ"
 
@@ -190,6 +351,11 @@ class YandexGPTClient:
                     if response.status_code == 429:
                         time.sleep(10)
                         continue
+                    if response.status_code == 400:
+                        logger.error(
+                            "Ошибка 400 на модели. Возможно, неверное имя модели или закончилась квота."
+                        )
+                        return None
                     return None
                 except Exception as e:
                     logger.error(f"Ошибка: {e}")
@@ -201,6 +367,23 @@ class YandexGPTClient:
 
     def _extract_json(self, text: str) -> Optional[dict]:
         """Извлекает JSON из текста ответа."""
+        if "{" in text and "}" in text:
+            # Находим последнюю закрывающую скобку основного объекта
+            brace_count = 0
+            last_brace_idx = -1
+            for i, char in enumerate(text):
+                if char == "{":
+                    brace_count += 1
+                elif char == "}":
+                    brace_count -= 1
+                    if brace_count == 0:
+                        last_brace_idx = i
+                        break
+
+            if last_brace_idx != -1:
+                text = text[: last_brace_idx + 1]
+        # ==========================================
+
         json_match = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL)
         if json_match:
             json_str = json_match.group(1)

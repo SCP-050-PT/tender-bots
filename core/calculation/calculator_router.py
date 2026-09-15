@@ -54,28 +54,60 @@ class CalculatorRouter:
             )
         # ==========================================
 
+        # 1. Сначала получаем результат расчета в переменную result
         if tender_type == "sout":
-            return self._calc_sout(tender_info)
+            result = self._calc_sout(tender_info)
         elif tender_type == "education":
-            return self._calc_education(tender_info, documents_text)
+            result = self._calc_education(tender_info, documents_text)
         elif tender_type == "opr":
-            return self._calc_opr(tender_info, documents_text)
+            result = self._calc_opr(tender_info, documents_text)
         elif tender_type in ("plk", "testing"):
-            return self._calc_plk(tender_info, documents_text)
+            result = self._calc_plk(tender_info, documents_text)
         elif tender_type == "combined":
-            return self._calc_combined(tender_info, documents_text)
+            result = self._calc_combined(tender_info, documents_text)
         else:
             return self._manual_review("Неизвестный тип тендера")
 
-    # ==================== СОУТ ====================
+        # 2. Теперь применяем SANITY CHECK к полученному результату
+        # === SANITY CHECK: Проверка адекватности цены ===
+        nmck = tender_info.get("nmck", 0)
+        
+        # Проверяем, что результат вообще существует и это не ручная проверка без цены
+        if result and nmck > 0 and result.recommended_price > 0:
+            ratio = result.recommended_price / nmck
+            
+            # Если наша цена меньше 20% от НМЦК или больше 150% — это подозрительно
+            if ratio < 0.2 or ratio > 1.5:
+                logger.warning(
+                    f"[{self.VERSION}] SANITY CHECK FAIL: Цена {result.recommended_price:.0f} "
+                    f"при НМЦК {nmck:.0f} (Ratio: {ratio:.2f})"
+                )
+                result.needs_manual_review = True
+                # Добавляем причину к существующим, если они есть
+                reason_prefix = f"Аномальное соотношение цены к НМЦК ({ratio:.0%}). "
+                if result.review_reason:
+                    result.review_reason = f"{reason_prefix} | {result.review_reason}"
+                else:
+                    result.review_reason = f"{reason_prefix}Требуется ручная проверка."
+        # ==============================================
+
+        # 3. Возвращаем проверенный результат
+        return result
+
+    # ==================== СОУТ (v7.6.0: Единая формула) ====================
     def _calc_sout(self, info: Dict[str, Any]) -> CalculationResult:
+        # === Проверка на осознанную ошибку/блокировку от Агента ===
+        if info.get("agent_blocked"):
+            reason = info.get("agent_block_reason", "Заблокировано агентом")
+            logger.warning(f"[{self.VERSION}] Тендер заблокирован агентом (нет файлов): {reason}")
+            return self._manual_review(reason)
+        # ==========================================
+
         rm_total = info.get("rm_total", 0)
 
-        # === v7.3.1: Приоритет LLM над fallback ===
-        # Если LLM нашёл количество, не используем fallback по НМЦК
         if not rm_total:
             nmck = info.get("nmck", 0)
-            if nmck > 0 and not info.get("llm_found_rm"):  # Флаг, что LLM не нашёл
+            if nmck > 0 and not info.get("llm_found_rm"):
                 estimated_rm = int(nmck / 1200)
                 logger.warning(
                     f"[{self.VERSION}] СОУТ: кол-во не найдено. Оценка по НМЦК: {estimated_rm} РМ"
@@ -86,23 +118,26 @@ class CalculatorRouter:
                 return self._manual_review("Не определено количество РМ")
 
         region = info.get("region", "") or info.get("customer_region", "")
-
-        # v7.3.0: Мульти-регион detection
         cities_count = info.get("cities_count", 1)
         regions_count = info.get("regions_count", 1)
 
+        # ИСПРАВЛЕНИЕ: Удаляем variant, так как старый калькулятор его не знает
+        safe_info = dict(info)
+        safe_info.pop("variant", None) 
+
         return self.calculator.calculate_sout(
             rm_total=rm_total,
-            variant=info.get("variant", 1),
-            addresses_count=info.get("addresses_count", 1),
-            cities_count=cities_count,
+            rm_with_iii=safe_info.get("rm_with_iii", 0),
+            needs_subcontractor=safe_info.get("needs_subcontractor", False),
+            delivery_count=safe_info.get("delivery_count", 1),
+            is_annual=safe_info.get("is_annual", False),
+            trip_days=safe_info.get("trip_days", 3),
             regions_count=regions_count,
-            trip_days=info.get("trip_days", 3),
-            rm_with_iii=info.get("rm_with_iii", 0),
-            is_seasonal=info.get("is_seasonal", False),
-            is_annual=info.get("is_annual", False),
-            transport_cost=info.get("transport_cost", 0),
+            transport_cost=safe_info.get("transport_cost", 0),
+            is_seasonal=safe_info.get("is_seasonal", False),
             region=region,
+            cities_count=cities_count,
+            addresses_count=safe_info.get("addresses_count", 1),
         )
 
     # ==================== Обучение ====================
@@ -222,6 +257,9 @@ class CalculatorRouter:
             needs_dsiz_norms=info.get("needs_dsiz_norms", False),
             needs_iot_norms=info.get("needs_iot_norms", False),
             transport_cost=info.get("transport_cost", 0),
+            trip_days=info.get("trip_days", 0),
+            cities_count=info.get("cities_count", 1),  
+            addresses_count=info.get("addresses_count", 1),  
         )
 
     # ==================== ПЛК ====================
@@ -272,13 +310,16 @@ class CalculatorRouter:
 
         return self.calculator.calculate_plk(
             points_count=points,
-            factors_count=len(measurement_types),  # <-- Используем реальный список
+            factors_count=len(measurement_types),
             delivery_count=info.get("delivery_count", 1),
             is_annual=info.get("is_annual", False),
             needs_subcontractor=needs_subcontractor,
             distance_km=info.get("distance_km", 0),
             transport_cost=info.get("transport_cost", 0),
             accommodation_cost=info.get("accommodation_cost", 0),
+            trip_days=info.get("trip_days", 0),
+            cities_count=info.get("cities_count", 1),  
+            addresses_count=info.get("addresses_count", 1),  
         )
 
     # ==================== Комбинированный ====================

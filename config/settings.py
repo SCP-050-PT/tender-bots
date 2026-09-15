@@ -22,7 +22,7 @@ class Settings:
     # === YANDEX GPT ===
     YANDEX_FOLDER_ID: str = os.getenv("YANDEX_FOLDER_ID", "")
     YANDEX_API_KEY: str = os.getenv("YANDEX_API_KEY", "")
-    YANDEX_GPT_MODEL: str = os.getenv("YANDEX_GPT_MODEL", "yandexgpt-lite")
+    YANDEX_GPT_MODEL: str = os.getenv("YANDEX_GPT_MODEL", "yandexgpt")
 
     # === YANDEX AGENT ===
     YANDEX_AGENT_API_KEY: str = os.getenv("YANDEX_AGENT_API_KEY", "")
