@@ -2,21 +2,29 @@
 core/calculation/cost_loader.py
 Ленивая загрузка базы цен из costs_db.json.
 Вынесено из calculator.py (v6.5).
-ИСПРАВЛЕНО (v6.8.6):
-  - Добавлен protocol в education.documents (P0-fix)
-  - Добавлен minimum_price в education (P0-fix)
-  - Добавлены комментарии к default costs
+
+v8.0.0-Optimized:
+  - Добавлена возможность инвалидации кэша (reload_costs).
+  - Улучшена обработка ошибок чтения и парсинга JSON.
+  - Точная типизация Dict[str, Any].
 """
 
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any
 from loguru import logger
 
-COSTS: Optional[dict] = None
+COSTS: Optional[Dict[str, Any]] = None
 
 
-def load_costs() -> dict:
+def reload_costs() -> Dict[str, Any]:
+    """Принудительно сбрасывает кэш и перезагружает базу цен из файла."""
+    global COSTS
+    COSTS = None
+    return load_costs()
+
+
+def load_costs() -> Dict[str, Any]:
     """Ленивая загрузка базы цен."""
     global COSTS
     if COSTS is not None:
@@ -31,25 +39,27 @@ def load_costs() -> dict:
             with open(costs_db_path, "r", encoding="utf-8") as f:
                 COSTS = json.load(f)
             logger.info(f"✅ База цен загружена: {costs_db_path}")
+        except json.JSONDecodeError as e:
+            logger.error(
+                f"❌ Ошибка синтаксиса JSON в costs_db.json (строка {e.lineno}, колонка {e.colno}): {e}"
+            )
+            COSTS = _get_default_costs()
         except Exception as e:
             logger.error(f"❌ Ошибка загрузки costs_db.json: {e}")
             COSTS = _get_default_costs()
     else:
         logger.warning(f"⚠️ Файл costs_db.json не найден: {costs_db_path}")
-        logger.warning(f"⚠️ Используются значения по умолчанию")
+        logger.warning("⚠️ Используются значения по умолчанию")
         COSTS = _get_default_costs()
 
     return COSTS
 
 
-def _get_default_costs() -> dict:
+def _get_default_costs() -> Dict[str, Any]:
     """Встроенные значения по умолчанию — ЦЕНЫ ДЛЯ КЛИЕНТА.
 
     ВАЖНО: Этот fallback используется ТОЛЬКО если costs_db.json не найден
     или повреждён. Все значения должны соответствовать актуальным ценам.
-
-    История изменений:
-      v6.8.6: +protocol, +minimum_price (исправление P0-багов)
     """
     return {
         "education": {
@@ -58,7 +68,6 @@ def _get_default_costs() -> dict:
                 "diploma": {"cost": 265},
                 "certificate_worker": {"cost": 80},
                 "certificate_qualification": {"cost": 130},
-                # v6.8.6-fix: protocol был отсутствовал → KeyError при fallback
                 "protocol": {"cost": 3.65},
             },
             "materials": {
@@ -77,7 +86,6 @@ def _get_default_costs() -> dict:
             "overhead": {
                 "base": {"cost": 100},
             },
-            # v6.8.6-fix: minimum_price был отсутствовал → KeyError при fallback
             "minimum_price": {
                 "distance": 10000,
                 "full_time": 10000,
@@ -145,14 +153,12 @@ def _get_default_costs() -> dict:
             "subcontractor": {
                 "default_cost": 10000,
             },
-            # v6.8.6-fix: transport_default убран (был 40000, теперь расчёт по километражу)
             "travel": {
                 "accommodation_default": 4000,
                 "daily_allowance": 4000,
             },
         },
         "opr": {
-            # v6.8.6-fix: margin_percent читается из конфига, не hardcoded
             "margin_percent": 10,
             "rates": {
                 "per_position": {"cost": 500, "unit": "должность"},
@@ -187,7 +193,7 @@ def _get_default_costs() -> dict:
         "travel": {
             "fuel": {
                 "consumption_l_per_100km": 11,
-                "price_per_liter": 65,  # v6.8.6: синхронизировано с costs_db.json
+                "price_per_liter": 65,
             },
             "accommodation": {
                 "standard_per_night": 2500,
@@ -195,5 +201,12 @@ def _get_default_costs() -> dict:
             "daily_allowance": {
                 "standard": 500,
             },
+        },
+        "global_limits": {
+            "min_contract_sum": 10000,
+            "min_margin_percent": 10.0,
+            "max_cost_to_nmck_ratio": 0.85,
+            "max_tender_preparation_hours": 3,
+            "tender_specialist_rate_per_hour": 100,
         },
     }

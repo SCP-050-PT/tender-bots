@@ -1,14 +1,13 @@
 """
 core/google_sheets.py
-Работа с Google Sheets. Чтение, запись, проверка дубликатов, форматирование.
-Версия: v6.0 (26.07.2026) — исправлена опечатка "Способо", расширен диапазон A:T,
-добавлены колонки needs_manual_review, llm_confidence.
+Работа с Google Sheets. Чтение, запись, проверка дубликатов, форматирование и сборка строк.
+Версия: v7.7.0 — добавлены функции build_sheets_row и get_guarantee_info для полного выноса Sheets-логики из main.py.
 """
 
 import json
 import traceback
 from pathlib import Path
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 from dataclasses import dataclass
 from loguru import logger
 
@@ -23,9 +22,18 @@ except ImportError:
     logger.warning("gspread не установлен. Google Sheets недоступен.")
 
 from config.settings import settings
+from utils.price_parser import (
+    format_for_sheets as _format_nmck,
+    format_for_sheets as _format_price,
+)
+from utils.formatters import (
+    sanitize_for_sheets,
+    get_quantity,
+    build_calculation_breakdown,
+    build_short_recommendation,
+)
 
 # === СТРУКТУРА ЛИСТА "Тендера 2026 ИИ-бот" ===
-# ← v6.0: Исправлена опечатка "Способо" → "Способ", добавлены колонки S, T
 SHEET_COLUMNS = [
     "ID тендера",  # A
     "Ссылка на тендер",  # B
@@ -43,7 +51,7 @@ SHEET_COLUMNS = [
     "Цена предложения",  # N
     "Возможности экономии",  # O
     "Решение по участию",  # P
-    "Расчёты",  # Q ← НОВАЯ
+    "Расчёты",  # Q
     "Комментарий от ИИ-агента",  # R
     "Рекомендации",  # S
     "Комментарии руководителя отдела по участию",  # T
@@ -67,6 +75,151 @@ class TenderRecord:
 
     def is_duplicate_of(self, tender_id: str) -> bool:
         return self.tender_id == tender_id
+
+
+# === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ФОРМИРОВАНИЯ СТРОК (ВЫНЕСЕНО ИЗ MAIN.PY) ===
+
+
+def get_guarantee_info(detail, analysis) -> Tuple[str, str, str]:
+    """Извлекает информацию об обеспечении заявки и контракта."""
+    app_guarantee = contract_guarantee = guarantee_method = ""
+
+    if detail:
+        app_guarantee = (detail.application_guarantee or "").strip()
+        contract_guarantee = (detail.contract_guarantee or "").strip()
+        guarantee_method = (detail.guarantee_method or "").strip()
+
+    if analysis and hasattr(analysis, "details") and analysis.details:
+        d = analysis.details
+        if isinstance(d, dict):
+            app_guarantee = app_guarantee or d.get("application_guarantee", "")
+            contract_guarantee = contract_guarantee or d.get("contract_guarantee", "")
+            guarantee_method = guarantee_method or d.get("guarantee_method", "")
+        else:
+            app_guarantee = app_guarantee or getattr(d, "application_guarantee", "")
+            contract_guarantee = contract_guarantee or getattr(
+                d, "contract_guarantee", ""
+            )
+            guarantee_method = guarantee_method or getattr(d, "guarantee_method", "")
+
+    if not app_guarantee:
+        app_guarantee = "Не требуется"
+    if not contract_guarantee:
+        contract_guarantee = "Не требуется"
+    if not guarantee_method:
+        guarantee_method = "Не требуется"
+
+    return app_guarantee, contract_guarantee, guarantee_method
+
+
+def build_sheets_row(analysis, detail, tender) -> Dict[str, str]:
+    """Формирует строковый словарь для Google Sheets с приоритетом данных парсера."""
+    quantity = None
+    t_type = getattr(analysis, "tender_type", "")
+
+    if detail:
+        if t_type == "sout":
+            quantity = getattr(detail, "rm_total", None)
+        elif t_type == "plk":
+            quantity = getattr(detail, "points_count", None)
+        elif t_type == "education":
+            quantity = getattr(detail, "students_count", None)
+        elif t_type == "opr":
+            quantity = getattr(detail, "opr_positions", None) or getattr(
+                detail, "rm_total", None
+            )
+
+    if not quantity:
+        quantity = get_quantity(analysis)
+
+    if not quantity:
+        quantity = "?"
+
+    app_guarantee, contract_guarantee, guarantee_method = get_guarantee_info(
+        detail, analysis
+    )
+
+    law = tender.law.replace("-FZ", "-ФЗ") if getattr(tender, "law", None) else ""
+    procurement = (
+        f"{detail.purchase_method}, {law}"
+        if detail and getattr(detail, "purchase_method", None)
+        else law
+    )
+
+    ai_comment = sanitize_for_sheets(getattr(analysis, "comment", "") or "")
+    purchase_name = getattr(tender, "title", "") or ""
+    if (
+        detail
+        and getattr(detail, "purchase_name", None)
+        and len(detail.purchase_name) > 10
+    ):
+        purchase_name = detail.purchase_name
+
+    etp_name = ""
+    if detail:
+        etp_name = (
+            getattr(detail, "platform_name", None) or getattr(detail, "etp", None) or ""
+        )
+    if not etp_name and hasattr(tender, "etp") and tender.etp:
+        etp_name = tender.etp
+
+    deadline = (
+        detail.deadline_date
+        if detail and getattr(detail, "deadline_date", None)
+        else getattr(tender, "deadline_date", "")
+    )
+
+    decision_override = getattr(analysis, "decision", "")
+    if hasattr(analysis, "details") and analysis.details:
+        d = analysis.details
+        is_forbidden = (
+            isinstance(d, dict) and d.get("_forbidden_direction")
+        ) or getattr(d, "_forbidden_direction", False)
+        if is_forbidden:
+            decision_override = "не рекомендуется"
+            ai_comment = "[FORBIDDEN] ЗАПРЕЩЁННОЕ НАПРАВЛЕНИЕ: " + ai_comment
+
+    # Безопасное извлечение комиссии ЭТП
+    etp_commission = 0
+    if hasattr(analysis, "details") and analysis.details:
+        if isinstance(analysis.details, dict):
+            etp_commission = analysis.details.get("etp_commission", 0)
+        else:
+            etp_commission = getattr(analysis.details, "etp_commission", 0)
+
+    nmck_val = (
+        detail.nmck if detail and getattr(detail, "nmck", None) else 0
+    ) or getattr(analysis, "nmck", 0)
+
+    return {
+        "ID тендера": tender.tender_id,
+        "Ссылка на тендер": getattr(tender, "url", ""),
+        "Наименование услуг": purchase_name,
+        "Способ проведения закупки": procurement,
+        "ЭТП": etp_name,
+        "Комиссия ЭТП": f"{etp_commission:,.0f} ₽" if etp_commission else "0 ₽",
+        "Регион": (
+            detail.customer_region
+            if detail and getattr(detail, "customer_region", None)
+            else getattr(tender, "region", "") or ""
+        ),
+        "Обеспечение заявки": app_guarantee,
+        "Обеспечение контракта": contract_guarantee,
+        "Способ обеспечения исполнения": guarantee_method,
+        "Срок подачи заявки до": deadline,
+        "НМЦК": _format_nmck(nmck_val),
+        "Количество": quantity,
+        "Цена предложения": _format_price(getattr(analysis, "recommended_price", 0)),
+        "Возможности экономии": "",
+        "Решение по участию": decision_override,
+        "Расчёты": sanitize_for_sheets(build_calculation_breakdown(analysis)),
+        "Комментарий от ИИ-агента": ai_comment,
+        "Рекомендации": sanitize_for_sheets(build_short_recommendation(analysis)),
+        "Комментарии руководителя отдела по участию": "",
+        "Дата заключения контракта": "",
+        "Дата выполнения работ": "",
+        "Результат": "",
+    }
 
 
 class GoogleSheetsManager:
@@ -104,18 +257,13 @@ class GoogleSheetsManager:
 
         self._connect()
 
-    def _validate_credentials(self) -> tuple[bool, str]:
-        """
-        Проверяет файл credentials перед подключением.
-        Возвращает (ok, message).
-        """
+    def _validate_credentials(self) -> Tuple[bool, str]:
+        """Проверяет файл credentials перед подключением."""
         creds_path = Path(self.credentials_path)
 
-        # 1. Проверка существования файла
         if not creds_path.exists():
             return False, f"Файл credentials НЕ НАЙДЕН: {creds_path.absolute()}"
 
-        # 2. Проверка что это JSON
         try:
             with open(creds_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -124,7 +272,6 @@ class GoogleSheetsManager:
         except Exception as e:
             return False, f"Ошибка чтения credentials: {e}"
 
-        # 3. Проверка обязательных полей
         required_fields = ["private_key", "client_email", "token_uri"]
         missing = [f for f in required_fields if f not in data or not data[f]]
         if missing:
@@ -133,27 +280,23 @@ class GoogleSheetsManager:
                 f"Убедитесь, что вы скачали ПОЛНЫЙ JSON-ключ из Google Cloud Console."
             )
 
-        # 4. Проверка что private_key не пустой
         if len(data["private_key"]) < 100:
             return False, "private_key слишком короткий — возможно, файл повреждён"
 
-        # 5. Проверка client_email
         if "@" not in data.get("client_email", ""):
             return False, "client_email невалиден"
 
         return True, "OK"
-    
+
     def ensure_headers(self) -> bool:
         """Проверяет и обновляет заголовки первой строки."""
         try:
             current_headers = self.worksheet.row_values(1)
 
-            # Если заголовки уже правильные — ничего не делаем
             if current_headers == SHEET_COLUMNS:
                 logger.info("✅ Заголовки актуальны")
                 return True
 
-            # Иначе — перезаписываем
             end_col = self._col_index_to_letter(len(SHEET_COLUMNS))
             self.worksheet.update(f"A1:{end_col}1", [SHEET_COLUMNS])
             logger.info(f"✅ Заголовки обновлены: {len(SHEET_COLUMNS)} колонок")
@@ -166,7 +309,6 @@ class GoogleSheetsManager:
     def _connect(self):
         """Устанавливает соединение с Google Sheets с детальным логированием."""
         try:
-            # Шаг 1: Валидация credentials
             logger.info(f"🔐 Проверка credentials: {self.credentials_path}")
             ok, msg = self._validate_credentials()
             if not ok:
@@ -174,7 +316,6 @@ class GoogleSheetsManager:
                 raise ValueError(msg)
             logger.info("✅ Credentials валидны")
 
-            # Шаг 2: Загрузка credentials
             creds_path = Path(self.credentials_path)
             credentials = Credentials.from_service_account_file(
                 str(creds_path), scopes=self.SCOPES
@@ -183,16 +324,13 @@ class GoogleSheetsManager:
                 f"✅ Credentials загружены: {credentials.service_account_email}"
             )
 
-            # Шаг 3: Авторизация
             self.client = gspread.authorize(credentials)
             logger.info("✅ Авторизация gspread успешна")
 
-            # Шаг 4: Открытие таблицы
             logger.info(f"🔓 Открытие таблицы: {self.spreadsheet_id}")
             self.sheet = self.client.open_by_key(self.spreadsheet_id)
             logger.info(f"✅ Таблица открыта: {self.sheet.title}")
 
-            # Шаг 5: Подключение к листу
             logger.info(f'📄 Поиск листа: "{self.worksheet_name}"')
             available_sheets = [w.title for w in self.sheet.worksheets()]
             logger.info(f"   Доступные листы: {available_sheets}")
@@ -214,7 +352,6 @@ class GoogleSheetsManager:
             )
 
         except Exception as e:
-            # Детальный вывод ошибки с traceback
             error_msg = (
                 f"Ошибка подключения к Google Sheets: {type(e).__name__}: {str(e)}"
             )
@@ -239,6 +376,15 @@ class GoogleSheetsManager:
     def add_tender_to_top(self, data: Dict, check_duplicate: bool = True) -> bool:
         try:
             tender_id = data.get("ID тендера", "")
+            decision = (data.get("Решение по участию") or "").lower().strip()
+
+            # === Фильтр: записываем только "рекомендуется" ===
+            if decision != "рекомендуется":
+                logger.info(
+                    f"Пропуск записи в Sheets: {tender_id} "
+                    f"(решение = '{data.get('Решение по участию')}')"
+                )
+                return False
 
             if check_duplicate and tender_id:
                 existing_row = self.find_duplicate(tender_id)
@@ -249,11 +395,8 @@ class GoogleSheetsManager:
             row = [data.get(col, "") for col in SHEET_COLUMNS]
             self.worksheet.insert_row(row, index=2, value_input_option="USER_ENTERED")
 
-            decision = data.get("Решение по участию", "")
-            if decision == "не участвуем":
-                self._format_row_red(2)
-            elif decision == "рекомендуется":
-                self._format_row_green(2)
+            # Зелёное форматирование для рекомендованных
+            self._format_row_green(2)
 
             logger.info(f'✅ Тендер {tender_id} добавлен в "{self.worksheet_name}"')
             return True
@@ -262,11 +405,10 @@ class GoogleSheetsManager:
             logger.error(f"Ошибка добавления тендера: {e}")
             logger.error(f"Traceback:\n{traceback.format_exc()}")
             return False
-
+    
     def update_tender(self, row_number: int, data: Dict) -> bool:
         try:
             row = [data.get(col, "") for col in SHEET_COLUMNS]
-            # ← v6.0: Динамический расчёт end_col для 20 колонок
             end_col = self._col_index_to_letter(len(SHEET_COLUMNS))
             self.worksheet.update(f"A{row_number}:{end_col}{row_number}", [row])
             logger.info(f"Строка {row_number} обновлена")
@@ -275,7 +417,6 @@ class GoogleSheetsManager:
             logger.error(f"Ошибка обновления: {e}")
             return False
 
-    # ← v6.0: Вспомогательный метод для конвертации индекса колонки в букву
     def _col_index_to_letter(self, index: int) -> str:
         """Конвертирует индекс колонки (1-based) в буквенное обозначение."""
         result = ""
@@ -286,9 +427,8 @@ class GoogleSheetsManager:
 
     def _format_row_red(self, row_number: int):
         try:
-            # ← v6.0: Расширен диапазон до T
             self.worksheet.format(
-                f"A{row_number}:W{row_number}", 
+                f"A{row_number}:W{row_number}",
                 {"backgroundColor": {"red": 0.95, "green": 0.8, "blue": 0.8}},
             )
         except Exception as e:
@@ -296,7 +436,6 @@ class GoogleSheetsManager:
 
     def _format_row_green(self, row_number: int):
         try:
-            # ← v6.0: Расширен диапазон до T
             self.worksheet.format(
                 f"A{row_number}:W{row_number}",
                 {"backgroundColor": {"red": 0.8, "green": 0.95, "blue": 0.8}},
@@ -306,7 +445,6 @@ class GoogleSheetsManager:
 
     def _format_row_yellow(self, row_number: int):
         try:
-            # ← v6.0: Расширен диапазон до T
             self.worksheet.format(
                 f"A{row_number}:W{row_number}",
                 {"backgroundColor": {"red": 1.0, "green": 0.95, "blue": 0.8}},
@@ -333,11 +471,12 @@ class GoogleSheetsManager:
     def check_exists(self, tender_id: str) -> bool:
         """Быстрая проверка наличия тендера в таблице."""
         try:
-            # Ищем только в колонке A (ID тендера)
             cell = self.worksheet.find(str(tender_id), in_column=1)
             return cell is not None
         except Exception:
             return False
+
+
 _sheets_manager: Optional[GoogleSheetsManager] = None
 
 

@@ -1,10 +1,19 @@
 {
-  "description": "Формулы, коэффициенты и guard'ы для расчета себестоимости и цены участия.",
+  "description": "Формулы, коэффициенты, нормативы и ограничения для расчета себестоимости и цены участия.",
   "global_limits": {
     "min_margin_percent": 10.0,
     "max_cost_to_nmck_ratio": 0.9,
     "urgency_multiplier_threshold_days": 14,
-    "urgency_overhead_increase": 0.5
+    "urgency_overhead_increase": 0.5,
+    "daily_allowance_per_day": 500,
+    "bank_guarantee_min_cost": 2000,
+    "bank_guarantee_threshold": 15000
+  },
+  "min_tender_amounts": {
+    "education_distance": 10000,
+    "sout": 20000,
+    "plk": 15000,
+    "opr": 15000
   },
   "etp_commissions": {
     "ртс-тендер": 1.0,
@@ -17,33 +26,45 @@
     "sout": {
       "base_price_per_rm": 213,
       "materials_per_rm": 73,
-      "delivery_cost": 2000,
+      "delivery_cost_per_shipment": 1000,
       "measurer_daily": 15000,
-      "accommodation_per_night": 5000,
+      "accommodation_per_night": 4000,
       "flight_avg": 8000,
       "specialist_hourly": 100,
-      "specialist_hours_base": 3
+      "specialist_hours_base": 3,
+      "iii_pricing_tier": [
+        { "max_rm": 10, "cost": 5000 },
+        { "max_rm": 15, "cost": 6000 },
+        { "max_rm": 20, "cost": 7000 }
+      ]
     },
     "education": {
       "portal_fee_per_student": 57,
       "certificate_cost": 60,
       "diploma_cost": 265,
-      "protocol_cost": 3.65,
+      "worker_cert_cost": 80,
       "qual_cert_cost": 130,
-      "labor_specialist": 300,
+      "protocol_cost": 3.65,
+      "lamination_sheet_cost": 10,
+      "delivery_cost_per_shipment": 300,
+      "overhead_base": 100,
       "labor_methodist": 681,
       "labor_ro": 1800,
-      "distance_transport_km_rate": 0,
-      "full_time_teacher_daily": 0,
-      "full_time_venue_daily": 0,
-      "full_time_manikin_daily": 0
+      "distance_transport_km_rate": 5.0,
+      "full_time_teacher_daily": 4000,
+      "full_time_venue_daily": 5000,
+      "full_time_manikin_daily": 2000
     },
     "opr": {
+      "base_materials_cost": 118.4,
       "siz_norms_cost_per_position": 200,
+      "delivery_cost_per_shipment": 1000,
       "margin_percent": 30.0
     },
     "plk": {
       "base_cost_per_point": 41.9,
+      "delivery_cost_per_shipment": 500,
+      "subcontractor_default_cost": 10000,
       "subcontractor_markup": 0
     }
   }

@@ -1,416 +1,255 @@
 """
 utils/llm_client.py
-Клиент для YandexGPT и AI Studio Agents через Responses API.
-v7.7.1: Исправлены пустые ответы агента (убрана обрезка input).
+Клиент для работы с Yandex AI Studio Agents и YandexGPT API.
 """
 
 import json
+import os
 import re
-from typing import Optional
+from typing import Optional, Dict, Any
+import requests
 from loguru import logger
 
-# Создаем отдельный логгер для "мышления" агента
-agent_logger = logger.bind(type="agent_thinking")
-
 try:
-    import openai
-
-    HAS_OPENAI = True
+    from openai import OpenAI
 except ImportError:
-    HAS_OPENAI = False
-    logger.warning("openai SDK не установлен. Агент будет недоступен.")
+    OpenAI = None
 
-from config.settings import settings
+agent_logger = logger.bind(type="agent_thinking")
 
 
 class YandexGPTClient:
-    # Эндпоинт для обычной модели
-    BASE_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
-    # Эндпоинт для агентов (OpenAI compatible)
-    AGENT_BASE_URL = "https://ai.api.cloud.yandex.net/v1"
+    """Клиент YandexGPT с поддержкой AI Studio Agents и классификацией по title."""
 
     def __init__(
-        self, folder_id=None, api_key=None, model=None, max_retries=3, timeout=60
+        self,
+        api_key: Optional[str] = None,
+        folder_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        model_name: Optional[str] = None,
     ):
-        self.folder_id = folder_id or settings.YANDEX_FOLDER_ID
-        self.max_retries = max_retries
-        self.timeout = timeout
+        # Автоматическое подтягивание из .env, если параметры не переданы явно
+        self.api_key = (
+            api_key or os.getenv("YANDEX_API_KEY") or os.getenv("YANDEX_GPT_API_KEY")
+        )
+        self.folder_id = folder_id or os.getenv("YANDEX_FOLDER_ID")
+        self.agent_id = (
+            agent_id or os.getenv("YANDEX_AGENT_ID") or os.getenv("YANDEX_GPT_AGENT_ID")
+        )
+        self.model_name = (
+            model_name or os.getenv("YANDEX_GPT_MODEL") or "yandexgpt/latest"
+        )
 
-        # Настройки Агента
-        self.use_agent = settings.USE_AI_AGENT
-        self.agent_id = settings.YANDEX_AGENT_ID
-        self.agent_api_key = settings.YANDEX_AGENT_API_KEY
-
-        # Настройки обычной модели
-        self.model_api_key = api_key or settings.YANDEX_API_KEY
-        self.model_name = model or settings.YANDEX_GPT_MODEL
-
-        if not self.folder_id:
-            raise ValueError("YANDEX_FOLDER_ID не задан")
-
-        if self.use_agent:
-            if not HAS_OPENAI:
-                logger.error("openai SDK не установлен. Переключаюсь на модель.")
-                self.use_agent = False
-            elif not self.agent_api_key or not self.agent_id:
-                logger.warning("USE_AI_AGENT=True, но ключи агента не заданы.")
-                self.use_agent = False
-            else:
-                logger.info(f" Режим АГЕНТА (Responses API): {self.agent_id}")
+        if OpenAI and self.api_key:
+            # Настройка OpenAI SDK под Yandex AI Studio
+            self.openai_client = OpenAI(
+                api_key=self.api_key,
+                base_url="https://ai.api.cloud.yandex.net/v1",
+                project=self.folder_id,
+            )
         else:
-            if not self.model_api_key:
-                raise ValueError("YANDEX_API_KEY не задан")
-            logger.info(f" Режим МОДЕЛИ: {self.model_name}")
+            self.openai_client = None
 
     def send(
-        self, system_prompt: str, user_message: str, temperature=0.3, max_tokens=2000
-    ) -> Optional[dict]:
+        self,
+        prompt: Optional[str] = None,
+        system_prompt: Optional[str] = None,
+        documents_text: str = "",
+        user_message: Optional[str] = None,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """Совместимость с LlmService."""
+        effective_prompt = prompt or user_message or ""
 
-        mode_name = "МОДЕЛЬ"
+        return self.analyze_documents(
+            prompt=effective_prompt,
+            documents_text=documents_text,
+            system_prompt=system_prompt,
+        )
 
-        # === РЕЖИМ АГЕНТА ЧЕРЕЗ ПРЯМОЙ HTTP-ЗАПРОС К RESPONSES API ===
-        if self.use_agent:
-            import requests as req_lib
-            import time
+    def classify_tender_type(self, title: str) -> str:
+        """Быстрая предварительная классификация тендера по названию."""
+        if not title or not title.strip():
+            return "other"
 
-            mode_name = "АГЕНТ (Responses API)"
-            agent_uri = f"gpt://{self.folder_id}/{self.agent_id}/latest"
-            url = "https://ai.api.cloud.yandex.net/v1/responses"
-            headers = {
-                "Authorization": f"Api-Key {self.agent_api_key}",
-                "Content-Type": "application/json",
-                "x-folder-id": self.folder_id,
-            }
+        system_prompt = (
+            "Ты — классификатор государственных закупок. "
+            "Твоя задача — определить тип тендера по его названию (объекту закупки).\n\n"
+            "Допустимые типы ответов:\n"
+            "- sout (Специальная оценка условий труда / СОУТ)\n"
+            "- opr (Оценка профессиональных рисков / ОПР)\n"
+            "- sout_opr (Совмещенный тендер: СОУТ + ОПР)\n"
+            "- education (Обучение по охране труда, ДПО, повышение квалификации, проверка знаний)\n"
+            "- plk (Производственный контроль / Лабораторные исследования)\n"
+            "- other (Любые другие услуги, товары или работы)\n\n"
+            "Отвечай СТРОГО одним словом из этого списка без пояснений, кавычек и знаков препинания."
+        )
 
-            payload = {
-                "input": user_message,
-                "prompt": {"id": self.agent_id},
-                "temperature": temperature,
-                "max_output_tokens": max_tokens,
-            }
+        user_prompt = f"Объект закупки: {title}"
 
-            log_payload = dict(payload)
-            if len(user_message) > 500:
-                log_payload["input"] = user_message[:500] + "..."
-            agent_logger.debug(
-                f"📤 ЗАПРОС К АГЕНТУ:\n{json.dumps(log_payload, ensure_ascii=False, indent=2)}"
+        try:
+            response_text = self._fallback_completion(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                max_tokens=20,
+                temperature=0.0,
             )
 
-            # === v7.8.0: RETRY ЛОГИКА ДЛЯ АГЕНТА ===
-            agent_retries = 3
-            for attempt in range(1, agent_retries + 1):
-                try:
-                    logger.info(
-                        f"Запрос к Yandex ({mode_name}) ID: {self.agent_id} (попытка {attempt}/{agent_retries})"
+            clean_res = response_text.strip().lower().replace('"', "").replace("'", "")
+
+            valid_types = {"sout", "opr", "sout_opr", "education", "plk", "other"}
+            if clean_res in valid_types:
+                return clean_res
+
+            for vt in valid_types:
+                if vt in clean_res:
+                    return vt
+
+            return "other"
+
+        except Exception as e:
+            logger.error(f"[Classify] Ошибка классификации YandexGPT по title: {e}")
+            return "unknown"
+
+    def analyze_documents(
+        self,
+        prompt: str,
+        documents_text: str = "",
+        system_prompt: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Глубокий анализ документов через AI Studio Agent или REST Fallback."""
+        full_user_prompt = f"{prompt}\n\nТекст документов:\n{documents_text[:100000]}"
+
+        # Вызов AI Studio Agent
+        if self.openai_client and self.agent_id:
+            try:
+                logger.info(
+                    f"Отправка запроса в AI Studio Agent (agent_id={self.agent_id})..."
+                )
+
+                response = self.openai_client.responses.create(
+                    prompt={"id": self.agent_id},
+                    input=full_user_prompt,
+                )
+
+                # Проверяем, не упал ли Агент на стороне Yandex Cloud (например, по MCP 403)
+                if getattr(response, "status", None) == "failed":
+                    error_msg = getattr(response, "error", None)
+                    logger.error(
+                        f"Yandex Agent завершился с ошибкой (failed): {error_msg}"
                     )
-                    logger.info(f"Вызов агента с prompt.id: {self.agent_id}")
+                    # Переходим на fallback
+                    raise RuntimeError(f"Agent failed: {error_msg}")
 
-                    response = req_lib.post(
-                        url, headers=headers, json=payload, timeout=self.timeout
-                    )
-                    response.raise_for_status()
-                    result = response.json()
+                # Извлекаем текст
+                output_text = getattr(response, "text", None) or getattr(
+                    response, "output_text", ""
+                )
+                logger.info(f"📄 ТЕЛО ОТВЕТА АГЕНТА:\n{output_text}")
+                if not output_text:
+                    output_text = str(response)
 
-                    # Парсим ответ от Responses API
-                    text = ""
-                    if "output" in result:
-                        for item in result.get("output", []):
-                            if item.get("type") == "message":
-                                for content in item.get("content", []):
-                                    if content.get("type") == "output_text":
-                                        text += content.get("text", "")
-                    elif "result" in result:
-                        text = (
-                            result.get("result", {})
-                            .get("alternatives", [{}])[0]
-                            .get("message", {})
-                            .get("text", "")
-                        )
+                parsed_json = self._extract_json(output_text)
+                if parsed_json:
+                    return parsed_json
 
-                    agent_logger.debug(f"📥 СЫРОЙ ОТВЕТ АГЕНТА:\n{text}")
-                    logger.info(f" ПОЛНЫЙ ОТВЕТ АГЕНТА:\n{text[:1000]}...")
+                return {"raw_response": output_text}
 
-                    # === v7.8.0: Если ответ пустой — пробуем снова ===
-                    if not text or len(text.strip()) < 5:
-                        logger.warning(
-                            f"[{mode_name}] Пустой ответ (попытка {attempt}/{agent_retries})"
-                        )
-                        agent_logger.warning(f"⚠️ ПУСТОЙ ОТВЕТ (попытка {attempt})")
-                        if attempt < agent_retries:
-                            time.sleep(2 * attempt)
-                            continue
-                        else:
-                            logger.error(
-                                "❌ ПУСТОЙ ОТВЕТ ОТ АГЕНТА (все попытки исчерпаны)"
-                            )
-                            agent_logger.error(
-                                "❌ ПУСТОЙ ОТВЕТ ОТ АГЕНТА (все попытки исчерпаны)"
-                            )
-                            return None
-                    # ==========================================
+            except Exception as e:
+                logger.warning(
+                    f"Ошибка вызова AI Studio Agent: {e}. Переход на REST fallback..."
+                )
 
-                    parsed = self._extract_json(text)
-
-                    # Обработка осознанных ошибок агента
-                    if parsed and parsed.get("error") == "true":
-                        reason = parsed.get("reason", "Неизвестная ошибка")
-                        suggestion = parsed.get("suggestion", "")
-                        logger.warning(f"⚠️ Агент ОТКАЗАЛСЯ анализировать: {reason}")
-                        agent_logger.error(f"❌ ОШИБКА АГЕНТА: {reason}")
-                        if suggestion:
-                            agent_logger.info(f"💡 СОВЕТ АГЕНТА: {suggestion}")
-                        return {
-                            "blocked_by_error": True,
-                            "reason": reason,
-                            "suggestion": suggestion,
-                        }
-
-                    # Логирование мыслительного процесса
-                    if parsed:
-                        agent_logger.info(f" МЫСЛИ АГЕНТА:")
-                        agent_logger.info(
-                            f"   Уверенность: {parsed.get('confidence', 'N/A')}"
-                        )
-                        agent_logger.info(
-                            f"   Решение: {parsed.get('decision', parsed.get('recommendation', 'N/A'))}"
-                        )
-                        params = {
-                            k: v
-                            for k, v in parsed.items()
-                            if k
-                            not in [
-                                "reason",
-                                "confidence",
-                                "decision",
-                                "recommendation",
-                                "blocked_by_agent",
-                            ]
-                        }
-                        agent_logger.info(
-                            f"   Извлеченные параметры: {json.dumps(params, ensure_ascii=False, indent=4)}"
-                        )
-
-                    # Проверка на блокировку от агента
-                    if parsed and parsed.get("decision") == "не рекомендуется":
-                        logger.warning(
-                            f"🛑 АГЕНТ ЗАБЛОКИРОВАЛ ТЕНДЕР: {parsed.get('reason')}"
-                        )
-                        agent_logger.warning(f"🚫 БЛОКИРОВКА: {parsed.get('reason')}")
-                        return {
-                            "decision": "не рекомендуется",
-                            "reason": parsed.get("reason"),
-                            "confidence": 1.0,
-                            "blocked_by_agent": True,
-                        }
-
-                    # Маркировка ненадежных данных
-                    if parsed and parsed.get("confidence", 0) < 0.5:
-                        logger.warning(
-                            f"️ Низкая уверенность агента ({parsed.get('confidence')}). Помечаю для fallback."
-                        )
-                        parsed["llm_unreliable"] = True
-                        agent_logger.warning(
-                            f"⚠️ НИЗКАЯ УВЕРЕННОСТЬ: {parsed.get('confidence')}"
-                        )
-
-                    if parsed:
-                        logger.info("Ответ получен от АГЕНТ, извлекаю JSON...")
-                        return parsed
-                    else:
-                        # JSON не распарсился — возможно, модель вернула мусор. Пробуем снова.
-                        logger.warning(
-                            f"[{mode_name}] Не удалось распарсить JSON (попытка {attempt}/{agent_retries}): {text[:200]}"
-                        )
-                        if attempt < agent_retries:
-                            time.sleep(2 * attempt)
-                            continue
-                        else:
-                            return {"raw_text": text, "parse_error": True}
-
-                except req_lib.exceptions.Timeout:
-                    logger.warning(
-                        f"[{mode_name}] Таймаут (попытка {attempt}/{agent_retries})"
-                    )
-                    agent_logger.warning(f"⏰ ТАЙМАУТ (попытка {attempt})")
-                    if attempt < agent_retries:
-                        time.sleep(2 * attempt)
-                        continue
-                    else:
-                        logger.error(f"[{mode_name}] Все попытки исчерпаны (таймаут)")
-                        return None
-
-                except req_lib.exceptions.HTTPError as e:
-                    error_msg = str(e)
-                    logger.error(f"HTTP ошибка агента: {e}")
-                    agent_logger.error(f"❌ HTTP ОШИБКА: {error_msg}")
-
-                    if "403" in error_msg or "Forbidden" in error_msg:
-                        logger.error(
-                            "❌ Ошибка 403: API-ключ не имеет прав на вызов агентов."
-                        )
-                        logger.error(
-                            "💡 Решение: Создайте новый API-ключ для SA с полными правами на AI Studio."
-                        )
-                        self.use_agent = False
-                        break  # Выходим из цикла retry, переключаемся на модель
-                    elif "400" in error_msg or "Bad Request" in error_msg:
-                        logger.error("❌ Ошибка 400: Проверьте ID агента и Folder ID.")
-                        self.use_agent = False
-                        break
-                    elif "429" in error_msg:
-                        logger.warning(
-                            f"[{mode_name}] Rate limit (429), ждем 10 сек..."
-                        )
-                        if attempt < agent_retries:
-                            time.sleep(10)
-                            continue
-                        else:
-                            return None
-                    else:
-                        if attempt < agent_retries:
-                            time.sleep(2 * attempt)
-                            continue
-                        else:
-                            return None
-
-                except Exception as e:
-                    error_msg = str(e)
-                    logger.error(f"Ошибка вызова агента: {e}")
-                    agent_logger.error(f"❌ ОШИБКА ВЫЗОВА АГЕНТА: {error_msg}")
-                    if attempt < agent_retries:
-                        time.sleep(2 * attempt)
-                        continue
-                    else:
-                        logger.warning(
-                            "⚠️ Агент недоступен после всех попыток. Переключаюсь на обычную модель."
-                        )
-                        self.use_agent = False
-                        break
-            # === КОНЕЦ RETRY ЦИКЛА ===
-        # === РЕЖИМ ОБЫЧНОЙ МОДЕЛИ (FALLBACK) ===
-        if not self.use_agent:
-            mode_name = "МОДЕЛЬ (FALLBACK)" if hasattr(self, "_was_agent") else "МОДЕЛЬ"
-
-            import requests
-            import time
-
-            model_uri = f"gpt://{self.folder_id}/{self.model_name}/latest"
-            payload = {
-                "modelUri": model_uri,
-                "completionOptions": {
-                    "stream": False,
-                    "temperature": temperature,
-                    "maxTokens": str(max_tokens),
-                },
-                "messages": [
-                    {"role": "system", "text": system_prompt},
-                    {"role": "user", "text": user_message},
-                ],
-            }
-            headers = {
-                "Authorization": f"Api-Key {self.model_api_key}",
-                "x-folder-id": self.folder_id,
-                "Content-Type": "application/json",
-            }
-
-            for attempt in range(1, self.max_retries + 1):
-                try:
-                    logger.info(
-                        f"Запрос к Yandex ({mode_name}) попытка {attempt}/{self.max_retries}"
-                    )
-
-                    response = requests.post(
-                        self.BASE_URL,
-                        headers=headers,
-                        json=payload,
-                        timeout=self.timeout,
-                    )
-                    response.raise_for_status()
-                    result = response.json()
-
-                    if "result" in result and "alternatives" in result["result"]:
-                        text = result["result"]["alternatives"][0]["message"]["text"]
-                        logger.info(f"Ответ получен от {mode_name}, извлекаю JSON...")
-                        parsed = self._extract_json(text)
-                        return (
-                            parsed
-                            if parsed
-                            else {"raw_text": text, "parse_error": True}
-                        )
-                    else:
-                        logger.error(f"Неожиданная структура ответа: {result}")
-                        return None
-
-                except requests.exceptions.Timeout:
-                    logger.warning(f"Таймаут (попытка {attempt})")
-                    if attempt < self.max_retries:
-                        time.sleep(2**attempt)
-                    continue
-                except requests.exceptions.HTTPError as e:
-                    logger.error(f"HTTP ошибка: {e}")
-                    if response.status_code == 429:
-                        time.sleep(10)
-                        continue
-                    if response.status_code == 400:
-                        logger.error(
-                            "Ошибка 400 на модели. Возможно, неверное имя модели или закончилась квота."
-                        )
-                        return None
-                    return None
-                except Exception as e:
-                    logger.error(f"Ошибка: {e}")
-                    if attempt < self.max_retries:
-                        time.sleep(2**attempt)
-                    continue
-
-        return None
-
-    def _extract_json(self, text: str) -> Optional[dict]:
-        """Извлекает JSON из текста ответа."""
-        if "{" in text and "}" in text:
-            # Находим последнюю закрывающую скобку основного объекта
-            brace_count = 0
-            last_brace_idx = -1
-            for i, char in enumerate(text):
-                if char == "{":
-                    brace_count += 1
-                elif char == "}":
-                    brace_count -= 1
-                    if brace_count == 0:
-                        last_brace_idx = i
-                        break
-
-            if last_brace_idx != -1:
-                text = text[: last_brace_idx + 1]
-        # ==========================================
-
-        json_match = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL)
-        if json_match:
-            json_str = json_match.group(1)
         else:
-            json_match = re.search(r"```\s*(.*?)\s*```", text, re.DOTALL)
-            if json_match:
-                json_str = json_match.group(1)
-            else:
-                json_match = re.search(r"(\{.*\})", text, re.DOTALL)
-                if json_match:
-                    json_str = json_match.group(1)
-                else:
-                    return None
-        try:
-            return json.loads(json_str)
-        except json.JSONDecodeError:
+            if not self.agent_id:
+                logger.warning(
+                    "YANDEX_AGENT_ID не задан. Пропуск вызова Агента, переход к REST fallback..."
+                )
+
+        # Fallback на базовую модель YandexGPT
+        raw_text = self._fallback_completion(
+            system_prompt=system_prompt or "Ты профессиональный аналитик тендеров.",
+            user_prompt=full_user_prompt,
+        )
+
+        parsed_json = self._extract_json(raw_text)
+        if parsed_json:
+            return parsed_json
+
+        return {
+            "error": "Не удалось распарсить JSON из ответа модели",
+            "raw_response": raw_text,
+            "llm_unreliable": True,
+        }
+
+    def _fallback_completion(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        max_tokens: int = 2000,
+        temperature: float = 0.1,
+    ) -> str:
+        """Прямой REST запрос к Yandex Foundation Models API."""
+        url = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
+
+        model_name = self.model_name or "yandexgpt/latest"
+        if not model_name.startswith("gpt://"):
+            model_uri = f"gpt://{self.folder_id}/{model_name}"
+        else:
+            model_uri = model_name
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Api-Key {self.api_key}",
+            "x-folder-id": self.folder_id or "",
+        }
+
+        payload = {
+            "modelUri": model_uri,
+            "completionOptions": {
+                "stream": False,
+                "temperature": temperature,
+                "maxTokens": max_tokens,
+            },
+            "messages": [
+                {"role": "system", "text": system_prompt},
+                {"role": "user", "text": user_prompt},
+            ],
+        }
+
+        response = requests.post(url, headers=headers, json=payload, timeout=60)
+
+        if response.status_code == 401:
+            logger.error(
+                "[REST Fallback 401] Ошибка авторизации. Проверьте API-ключ в .env "
+                "и убедитесь, что у него нет ограничений в 'Области действия' (Scope)."
+            )
+
+        response.raise_for_status()
+
+        data = response.json()
+        alternatives = data.get("result", {}).get("alternatives", [])
+        if alternatives:
+            return alternatives[0].get("message", {}).get("text", "")
+
+        return ""
+
+    def _extract_json(self, text: str) -> Optional[Dict[str, Any]]:
+        """Извлечение и очистка JSON из текста ответа."""
+        if not text:
             return None
 
-    def analyze_tender(
-        self, tender_text: str, system_prompt: Optional[str] = None
-    ) -> Optional[dict]:
-        from config.prompts import load_system_prompt
+        match = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", text)
+        if match:
+            text = match.group(1)
+        else:
+            start = text.find("{")
+            end = text.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                text = text[start : end + 1]
 
-        prompt = system_prompt or load_system_prompt()
-        return self.send(
-            system_prompt=prompt,
-            user_message=tender_text,
-            temperature=0.2,
-            max_tokens=2500,
-        )
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            logger.error("Не удалось декодировать JSON из ответа LLM")
+            return None

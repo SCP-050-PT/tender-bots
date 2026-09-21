@@ -1,6 +1,6 @@
 {
-  "version": "1.7.1",
-  "updated": "2026-08-24",
+  "version": "1.7.2",
+  "updated": "2026-09-16",
   "currency": "RUB",
   "global_limits": {
     "min_contract_sum": 10000,
@@ -108,7 +108,7 @@
           1600,
           4000
         ],
-        "fuel_cost_per_km": 5,
+        "fuel_cost_per_km": 7.15,
         "daily_allowance": 500
       }
     },
@@ -200,7 +200,8 @@
       "post_russia": {
         "cost": 1000,
         "unit": "отправка",
-        "note": "Базовая стоимость для СОУТ"
+        "default_quantity": 2,
+        "note": "Базовая стоимость за 1 отправку (для СОУТ обычно требуется 2 отправки: проект + финальный отчёт = 2000₽)"
       },
       "post_russia_high": {
         "cost": 1000,
@@ -233,7 +234,7 @@
       },
       "variant_2": {
         "name": "1 карта + остаток из аналогии",
-        "description": "Карты по категориям (1500/2000) + остальное аналогия 200₽/РМ"
+        "description": "Карты по категориям (1500/2000) + остальное аналогия 100₽/РМ"
       },
       "variant_3": {
         "name": "Кол-во карт + комплекты протоколов (20%)",
@@ -287,7 +288,8 @@
     },
     "travel": {
       "accommodation_default": 4000,
-      "daily_allowance": 4000
+      "daily_allowance": 500,
+      "note": "Суточные 500₽/день (стандарт). Ставка замерщика при необходимости берется отдельно."
     },
     "periodicity": {
       "one_time": {
@@ -531,6 +533,16 @@
     ]
   },
   "notes": [
+    {
+      "version": "1.7.2",
+      "date": "2026-09-16",
+      "changes": [
+        "sout.calculation_variants.variant_2: скорректировано описание стоимости аналогии (200₽ → 100₽/РМ в соответствии с category_rates)",
+        "education.forms.full_time.fuel_cost_per_km: 5 → 7.15 (рассчитано из travel.fuel: 11л/100км * 65₽/л)",
+        "plk.travel.daily_allowance: 4000 → 500 (приведено к общему стандарту суточных, ставка замерщика приведена отдельно)",
+        "sout.delivery.post_russia: добавлен параметр default_quantity=2 (отражает норму 2 отправок: проект + итоговый отчёт)"
+      ]
+    },
     {
       "version": "1.7.1",
       "date": "2026-08-24",

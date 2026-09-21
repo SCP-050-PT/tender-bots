@@ -1,10 +1,10 @@
 """
 core/calculation/sout_calculator.py
 Расчёт цены на СОУТ.
-v7.6.0: Упрощённая единая формула по запросу клиента.
-  - Убраны варианты расчёта (variant 1/2/3).
-  - Упрощена логика командировочных.
-  - Прозрачная структура себестоимости.
+v7.8.2:
+  - Учтены cities_count и addresses_count при расчёте количества поездок.
+  - Динамическое получение margin_percent из costs_db.json.
+  - Защита от IndexError в _calc_subcontractor при пустых ranges.
 """
 
 from loguru import logger
@@ -14,12 +14,13 @@ from core.calculation.calculation_result import CalculationResult
 
 
 class SoutCalculator:
-    """Расчёт цены на СОУТ (единая упрощенная формула)."""
+    """Расчёт цены на СОУТ (упрощённая единая формула)."""
 
-    VERSION = "v7.6.0"
+    VERSION = "v7.8.2"
 
     def __init__(self):
-        self.costs = load_costs()["sout"]
+        self.all_costs = load_costs()
+        self.costs = self.all_costs["sout"]
         self.travel = self.costs.get("travel", {})
 
     def calculate(
@@ -53,14 +54,15 @@ class SoutCalculator:
         # 3. Доставка документов
         delivery_cost = self._calc_delivery(delivery_count, is_annual)
 
-        # 4. Командировочные / Транспорт
+        # 4. Командировочные / Транспорт (с учётом регионов, городов и адресов)
         travel_details = self._calc_travel(
             trip_days=trip_days,
             regions_count=regions_count,
+            cities_count=cities_count,
+            addresses_count=addresses_count,
             transport_cost=transport_cost,
             is_seasonal=is_seasonal,
             region=region,
-            cities_count=cities_count,
         )
 
         # 5. Субподряд на инструментальные измерения (если есть ИИИ)
@@ -77,9 +79,10 @@ class SoutCalculator:
             + subcontractor_cost
         )
 
-        # Маржа и рекомендуемая цена
-        margin_percent = 10.0
-        recommended_price = cost_price * 1.1
+        # Динамическая маржа из конфига (default: 10.0%)
+        margin_percent = float(self.costs.get("margin_percent", 10.0))
+        margin_rub = cost_price * (margin_percent / 100.0)
+        recommended_price = cost_price + margin_rub
 
         # Минимальный порог цены для СОУТ
         min_price = self.costs.get("min_contract_sum", 20000)
@@ -87,8 +90,6 @@ class SoutCalculator:
             recommended_price = min_price
             margin_rub = recommended_price - cost_price
             margin_percent = (margin_rub / cost_price * 100) if cost_price > 0 else 0
-        else:
-            margin_rub = cost_price * 0.1
 
         review_reason = ""
         if needs_manual_review:
@@ -124,6 +125,8 @@ class SoutCalculator:
                 "is_annual": is_annual,
                 "is_seasonal": is_seasonal,
                 "regions_count": regions_count,
+                "cities_count": cities_count,
+                "addresses_count": addresses_count,
                 "trip_days": trip_days,
             },
         )
@@ -131,7 +134,6 @@ class SoutCalculator:
     def _calc_materials(self, rm_total: int) -> float:
         """Расчёт материалов пропорционально количеству РМ."""
         mat_config = self.costs.get("materials", {})
-        # Если в конфиге есть стоимость за 1 РМ — используем её
         per_rm_cost = mat_config.get("cost_per_rm", 73)
         return rm_total * per_rm_cost
 
@@ -147,32 +149,38 @@ class SoutCalculator:
         self,
         trip_days: int,
         regions_count: int,
+        cities_count: int,
+        addresses_count: int,
         transport_cost: float,
         is_seasonal: bool,
         region: str,
-        cities_count: int,
     ) -> dict:
-        """Упрощённый расчёт транспорта."""
+        """Упрощённый расчёт транспорта и командировок."""
         seasonal_mult = self.travel.get("seasonal_multiplier", 2) if is_seasonal else 1
-        trips = max(1, regions_count)
+
+        # Количество поездок рассчитывается по максимальному числу локаций
+        effective_locations = max(regions_count, cities_count, addresses_count)
+        trips = max(1, effective_locations)
 
         # Если передана точная стоимость транспорта — берём её
         if transport_cost > 0:
             total = transport_cost * trips * seasonal_mult
             return {"total": total, "source": "explicit", "trips": trips}
 
-        # Иначе считаем по нормативам
+        # Иначе считаем по нормативу
         fixed_trip = self.travel.get("fixed_trip_cost", 12000)
         daily_rate = self.travel.get("daily_measurer_rate", 5000)
         accommodation = self.travel.get("accommodation_per_night", 2500)
 
-        # Бензин/выезд
+        # Бензин/выезд на каждую локацию
         auto_cost = fixed_trip * trips * seasonal_mult
-        # Суточные + замерщик
-        daily_cost = daily_rate * trip_days * trips * seasonal_mult
-        # Проживание
+
+        # Суточные / Работа замерщика (зависят от дней)
+        daily_cost = daily_rate * max(1, trip_days) * seasonal_mult
+
+        # Проживание (ночи = дни - 1)
         nights = max(0, trip_days - 1)
-        accom_cost = nights * trips * accommodation * seasonal_mult
+        accom_cost = nights * accommodation * seasonal_mult
 
         total = auto_cost + daily_cost + accom_cost
 
@@ -194,9 +202,11 @@ class SoutCalculator:
             for r in ranges:
                 if rm_with_iii <= r.get("max_rm", 9999):
                     return r["cost"], False
-            # Fallback если превышен максимум
+
+            # Fallback если превышен максимум или ranges пуст
             base = ranges[-1]["cost"] if ranges else 7000
-            extra = (rm_with_iii - ranges[-1].get("max_rm", 20)) * 350
+            max_rm_in_range = ranges[-1].get("max_rm", 20) if ranges else 20
+            extra = (rm_with_iii - max_rm_in_range) * 350
             return base + extra, False
 
         elif needs_subcontractor:

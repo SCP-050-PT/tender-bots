@@ -1,4 +1,5 @@
 """
+core/search/parser.py
 Парсинг HTML-карточек тендеров с zakupki.gov.ru.
 Вынесено из searcher.py (v6.6-r2).
 

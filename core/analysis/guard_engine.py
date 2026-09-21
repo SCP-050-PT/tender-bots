@@ -1,35 +1,44 @@
 """
 core/analysis/guard_engine.py
 Guard'ы для валидации и коррекции данных тендера.
-Вынесено из analyzer.py (v6.8.6-r3).
+Вынесено из analyzer.py.
 
-ИСПРАВЛЕНО (v7.8.1):
-- FIX: Guard 5 (Запрещенные направления) теперь учитывает тип тендера.
-  - Если тип 'education', игнорируем общие триггеры ПБ (обучение ПБ - это наш профиль).
-  - Для СОУТ/ОПР/ПЛК проверяем 'пожарная безопасность' только в названии, а не в тексте ТЗ (чтобы не блокировать из-за ссылок на нормы).
-  - Добавлены специфичные триггеры ПБ/Сантехники для проверки в тексте.
+v8.0.0-Optimized:
+- Добавлена интеграция с селективной системой блокировки Агента (передача agent_blocked).
+- Оптимизирован анализ текста документов: строгий срез до 2000 символов для быстрого поиска ключевых слов.
+- Исключение ложных срабатываний паттерна "единственный поставщик" при описании формы закупки.
 """
 
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 from loguru import logger
 
 
 class GuardEngine:
     """
-    Применяет guard'ы для исправления противоречивых данных.
+    Применяет guard'ы для исправления противоречивых данных и отсева непрофильных закупок.
     """
 
-    VERSION = "v7.8.1"
+    VERSION = "v8.0.0-Optimized"
 
     MAX_STUDENTS_CONFIDENCE = 500
     MIN_CONFIDENCE_THRESHOLD = 0.5
     OPR_RM_THRESHOLD = 200
 
     def apply(
-        self, tender_info: Dict[str, Any], tender_type: str
+        self,
+        tender_info: Dict[str, Any],
+        tender_type: str,
+        documents_text: Optional[str] = None,
     ) -> Tuple[Dict[str, Any], List[str]]:
+        """
+        Применяет набор защитных правил (guards) к данным тендера.
+        """
         guards = []
         info = dict(tender_info)
+
+        # Контекст документов: приоритет у прямо переданного текста, затем из tender_info
+        raw_doc_text = documents_text or info.get("documents_text", "")
+        documents_text_lower = raw_doc_text.lower()[:2000]
 
         # Guard 1: СОУТ/ОПР/ПЛК не имеют слушателей
         if tender_type in ("sout", "opr", "plk"):
@@ -83,9 +92,6 @@ class GuardEngine:
                 )
 
         # Guard 5: Запрещённые направления (умная проверка)
-        # Разделяем ключевые слова на "строгие" (блокируем везде) и "контекстные" (блокируем только в названии или если не обучение)
-
-        # 1. Строгие триггеры (Поставка, Сантехника, Специфичные услуги ПБ) - блокируем всегда, даже в обучении (если это поставка огнетушителей)
         STRICT_FORBIDDEN = [
             "поставка сиз",
             "поставка средств индивидуальной защиты",
@@ -128,10 +134,10 @@ class GuardEngine:
             "дератизация",
             "дезинсекция",
             "дезинфекция",
+            "строительный контроль",
+            "обследование зданий",
         ]
 
-        # 2. Контекстные триггеры (блокируем только если это НЕ обучение и встречается в НАЗВАНИИ)
-        # "пожарная безопасность" в тексте ТЗ по СОУТ - это норма. В названии "Услуги по пожарной безопасности" - это не наш профиль (если не обучение).
         CONTEXT_FORBIDDEN_TITLE_ONLY = [
             "пожарная безопасность",
             "медицинские работники",
@@ -139,19 +145,18 @@ class GuardEngine:
         ]
 
         purchase_name = info.get("purchase_name", "").lower()
-        documents_text_lower = info.get("documents_text", "").lower()[:2000]
 
         is_forbidden = False
         forbidden_kw_found = ""
 
-        # Проверка строгих триггеров (в названии ИЛИ в тексте)
+        # 1. Проверка строгих триггеров
         for kw in STRICT_FORBIDDEN:
             if kw in purchase_name or kw in documents_text_lower:
                 is_forbidden = True
                 forbidden_kw_found = kw
                 break
 
-        # Проверка контекстных триггеров (только в названии, и только если это НЕ обучение)
+        # 2. Проверка контекстных триггеров (в названии, только если не обучение)
         if not is_forbidden and tender_type != "education":
             for kw in CONTEXT_FORBIDDEN_TITLE_ONLY:
                 if kw in purchase_name:
@@ -165,23 +170,24 @@ class GuardEngine:
                 f"[{self.VERSION}] GUARD: Запрещённое направление '{forbidden_kw_found}' → не участвуем"
             )
             info["_forbidden_direction"] = True
-            info["review_reason"] = f"Не профильное направление: {forbidden_kw_found}"
+            info["agent_blocked"] = True
+            info["agent_block_reason"] = (
+                f"Запрещённое направление: {forbidden_kw_found}"
+            )
+            info["review_reason"] = f"Непрофильное направление: {forbidden_kw_found}"
 
-        # Guard 6: Признаки договорняка
+        # Guard 6: Признаки ограничений конкуренции / договорняка
         SUSPICIOUS_PATTERNS = [
             "торговая марка",
             "товарный знак",
             "конкретный производитель",
-            "единственный поставщик",
         ]
 
-        # Проверяем только текст документов на договорняк
         for pattern in SUSPICIOUS_PATTERNS:
-            if pattern in documents_text_lower:  # Используем уже обрезанный текст
-                # Исключение: "единственный поставщик" может быть в разделе "Способ определения поставщика" как описание метода,
-                # но если это в требованиях к участнику - плохо. Пока оставим простую проверку, но с логом.
-                # Чтобы избежать ложных срабатываний на описание метода закупки, можно проверить контекст, но пока оставим так.
-                guards.append(f"Подозрение на договорняк: '{pattern}' в ТЗ")
+            if pattern in documents_text_lower:
+                guards.append(
+                    f"Подозрение на ограничение конкуренции: '{pattern}' в ТЗ"
+                )
                 logger.warning(
                     f"[{self.VERSION}] GUARD: Подозрение на договорняк — '{pattern}' в ТЗ"
                 )

@@ -1,12 +1,12 @@
 """
+core/parsers/address_parser.py
 Парсинг адресов: извлечение городов, регионов, расчёт выездов.
-Вынесено из detailed_parser.py (v6.5).
 
-Багфикс v6.6-r2:
-  - Возвращает dict с regions_count (для calculator.py)
-  - trips = regions_count (не cities_count)
-  - Башкортостан=1 регион, не 9 городов
-  - Улучшенная фильтрация административных слов
+v6.7-r1:
+  - Исправлена рассинхронизация regions_count и списка regions при отсутствии явного региона
+  - Смягчена фильтрация по суффиксам (-ский/-ской), чтобы не терять реальные города (Майский, Приморск)
+  - Исправлен точный поиск слов в ADMIN_WORDS (замена 'in' на границу слова \b)
+  - Поддержка регистронезависимого поиска городов
 """
 
 import re
@@ -15,57 +15,81 @@ from loguru import logger
 
 from knowledge.regions import RUSSIAN_REGIONS
 
+
 class AddressParser:
     """Извлекает города, регионы и количество выездов из адресной строки."""
 
-    # Расширенный список административных слов
+    # Расширенный список административных слов (используется строго по границам слов)
     ADMIN_WORDS = {
-        "республика", "область", "край", "автономный", "округ",
-        "район", "муниципальный", "городской", "сельский",
-        "поселение", "сельсовет", "территория", "автодорога",
-        "километр", "здание", "строение", "корпус", "офис",
-        "этаж", "комната", "ул.", "пр.", "пер.", "просп.",
-        "б-р", "пл.", "ш.", "туп.", "наб.", "м.р-н",
+        "республика",
+        "область",
+        "край",
+        "автономный",
+        "округ",
+        "район",
+        "муниципальный",
+        "городской",
+        "сельский",
+        "поселение",
+        "сельсовет",
+        "территория",
+        "автодорога",
+        "километр",
+        "здание",
+        "строение",
+        "корпус",
+        "офис",
+        "этаж",
+        "комната",
+        "ул",
+        "пр",
+        "пер",
+        "просп",
+        "бр",
+        "пл",
+        "ш",
+        "туп",
+        "наб",
+        "мкр",
     }
 
-    # Ложные срабатывания
-    FAKE_CITY_WORDS = [
-        "поселение", "сельсовет", "муниципальный", "район",
-        "территория", "автодорога", "километр", "здание",
-        "строение", "корпус", "офис", "этаж", "комната",
-        "участок", "квартал", "промышленная", "площадка",
-        "база", "склад", "цех",
-    ]
+    # Ложные наименования населенных пунктов
+    FAKE_CITY_WORDS = {
+        "поселение",
+        "сельсовет",
+        "муниципальный",
+        "район",
+        "территория",
+        "автодорога",
+        "километр",
+        "здание",
+        "строение",
+        "корпус",
+        "офис",
+        "этаж",
+        "комната",
+        "участок",
+        "квартал",
+        "промышленная",
+        "площадка",
+        "база",
+        "склад",
+        "цех",
+        "помещение",
+    }
 
-    # Паттерны городов
+    # Паттерны городов (с учетом возможности нижнего регистра)
     CITY_PATTERNS = [
-        r"г\.?\s*([А-Я][а-я\-]+(?:\s+[А-Я][а-я\-]+)*)",
-        r"город\s+([А-Я][а-я\-]+(?:\s+[А-Я][а-я\-]+)*)",
-        r"п\.?\s*([А-Я][а-я\-]+(?:\s+[А-Я][а-я\-]+)*)",
-        r"пос(?:ёлок)?\.?\s*([А-Я][а-я\-]+(?:\s+[А-Я][а-я\-]+)*)",
-        r"пгт\.?\s*([А-Я][а-я\-]+(?:\s+[А-Я][а-я\-]+)*)",
-        r"с\.?\s*([А-Я][а-я\-]+(?:\s+[А-Я][а-я\-]+)*)",
-        r"д\.?\s*([А-Я][а-я\-]+(?:\s+[А-Я][а-я\-]+)*)",
+        r"г\.?\s*([А-Яа-яЁё\-]+(?:\s+[А-Яа-яЁё\-]+)*)",
+        r"город\s+([А-Яа-яЁё\-]+(?:\s+[А-Яа-яЁё\-]+)*)",
+        r"п\.?\s*([А-Яа-яЁё\-]+(?:\s+[А-Яа-яЁё\-]+)*)",
+        r"пос(?:ёлок)?\.?\s*([А-Яа-яЁё\-]+(?:\s+[А-Яа-яЁё\-]+)*)",
+        r"пгт\.?\s*([А-Яа-яЁё\-]+(?:\s+[А-Яа-яЁё\-]+)*)",
+        r"с\.?\s*([А-Яа-яЁё\-]+(?:\s+[А-Яа-яЁё\-]+)*)",
+        r"д\.?\s*([А-Яа-яЁё\-]+(?:\s+[А-Яа-яЁё\-]+)*)",
     ]
 
     def count_addresses(self, text: str, tender_type: str = "") -> Dict[str, Any]:
-        """
-        Возвращает детальную информацию об адресах.
-
-        Багфикс v6.6-r2:
-          - trips = regions_count (не cities_count)
-          - Возвращает regions_count для calculator.py
-
-        Returns:
-            {
-                'cities_count': int,        # Уникальные города
-                'regions_count': int,       # Уникальные регионы
-                'trips': int,               # Количество выездов = regions_count
-                'unique_cities': List[str],
-                'regions': List[str],
-                'needs_manual_check': bool
-            }
-        """
         if not text:
             return {
                 "cities_count": 0,
@@ -77,52 +101,49 @@ class AddressParser:
             }
 
         text = text.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
+        text = text.replace("–", "-").replace("—", "-")
 
-        # === Шаг 1: Проверяем нумерацию ===
-        numbered_pattern = r"(?:^|\n)\s*\d+[\.\)\-]\s+"
-        has_numbering = bool(re.search(numbered_pattern, text, re.MULTILINE))
+        # === Шаг 1: Разбиваем на потенциальные адресные строки ===
+        # Сначала пробуем маркированные списки
+        lines = re.split(r"(?:^|\n)\s*[-–—•]\s*", text)
+        lines = [l.strip() for l in lines if l.strip() and len(l.strip()) > 8]
 
-        # === Шаг 2: Разбиваем на адреса ===
-        if has_numbering:
-            lines = re.split(r"(?:^|\n)\s*\d+[\.\)\-]\s+", text)
-            lines = [l.strip() for l in lines if l.strip() and len(l.strip()) > 5]
-        else:
-            city_matches = []
-            for pattern in self.CITY_PATTERNS[:2]:
-                city_matches.extend(re.findall(pattern, text, re.IGNORECASE))
+        # Если получилось мало строк — пробуем по "г." / "город"
+        if len(lines) < 2:
+            raw_lines = re.split(r"(?=г\.?\s+[А-Яа-яЁё]|город\s+[А-Яа-яЁё])", text)
+            lines = [l.strip() for l in raw_lines if l.strip() and len(l.strip()) > 10]
 
-            if len(set(c.lower() for c in city_matches)) > 1:
-                raw_lines = re.split(r"(?=г\.?\s+[А-Я])", text)
-                lines = [l.strip() for l in raw_lines if l.strip() and len(l.strip()) > 10]
-            else:
-                lines = [text.strip()]
+        # Fallback — обычные переносы строк
+        if len(lines) < 2:
+            lines = [l.strip() for l in text.split("\n") if l.strip() and len(l.strip()) > 10]
 
-        # === Шаг 3: Извлекаем города и регионы ===
-        cities_by_region: Dict[str, Set[str]] = {}
-        current_region = None
+        # === Шаг 2: Извлекаем города и регионы ===
         all_cities: Set[str] = set()
         all_regions: Set[str] = set()
+        current_region = None
 
         for line in lines:
             line_lower = line.lower()
 
-            # Ищем регион
+            # Регион из строки
             region_match = re.search(
-                r"(республика\s+[а-я\-]+|[а-я\-]+\s+(?:область|край|ао|автономный\s+округ))",
+                r"(республика\s+[а-яё\-]+|[а-яё\-]+\s+(?:область|край|ао|автономный\s+округ)|респ\.?\s+[а-яё\-]+)",
                 line_lower,
             )
             if region_match:
                 current_region = region_match.group(1).strip()
+                # Нормализация
+                current_region = current_region.replace("респ.", "республика").title()
                 all_regions.add(current_region)
 
-            # Проверяем регионы из общего списка (для случаев без слова "область")
+            # Регионы из справочника
             for region_name in RUSSIAN_REGIONS:
                 if region_name.lower() in line_lower:
                     all_regions.add(region_name)
                     if not current_region:
                         current_region = region_name
 
-            # Ищем населённый пункт
+            # Город
             found_city = None
             for pattern in self.CITY_PATTERNS:
                 match = re.search(pattern, line, re.IGNORECASE)
@@ -130,56 +151,46 @@ class AddressParser:
                     found_city = match.group(1).strip()
                     break
 
-            # Fallback: "п.Имя" без пробела
             if not found_city:
-                match = re.search(r"[сдп]\.([А-Я][а-я\-]+)", line)
+                match = re.search(r"[сдп]\.([А-Яа-яЁё][а-яё\-]+)", line)
                 if match:
                     found_city = match.group(1).strip()
 
-            # Фильтрация
             if found_city and len(found_city) > 2:
-                found_city_lower = found_city.lower()
+                found_city_clean = found_city.strip(".,;: ")
+                found_city_lower = found_city_clean.lower()
 
-                if any(admin in found_city_lower for admin in self.ADMIN_WORDS):
-                    logger.debug(f"  [AddressParser] Пропущено (admin word): '{found_city}'")
+                words_in_city = set(re.findall(r"\w+", found_city_lower))
+                if words_in_city.intersection(self.ADMIN_WORDS):
+                    continue
+                if words_in_city.intersection(self.FAKE_CITY_WORDS):
                     continue
 
-                if any(fake in found_city_lower for fake in self.FAKE_CITY_WORDS):
-                    logger.debug(f"  [AddressParser] Пропущено (fake city): '{found_city}'")
-                    continue
-
-                # Фильтр: не похоже ли на район
-                if any(suffix in found_city_lower for suffix in ["ский", "ской", "ный", "ной"]):
-                    if " " not in found_city and len(found_city) > 8:
-                        logger.debug(f"  [AddressParser] Пропущено (похоже на район): '{found_city}'")
+                # Пропускаем явные районы
+                if "район" in line_lower and found_city_lower.endswith(("ский", "ской")):
+                    if f"{found_city_lower} район" in line_lower:
                         continue
 
-                region = current_region or "unknown"
-                if region not in cities_by_region:
-                    cities_by_region[region] = set()
-                cities_by_region[region].add(found_city_lower)
-                all_cities.add(found_city_lower)
+                formatted_city = found_city_clean.capitalize()
+                all_cities.add(formatted_city)
 
         total_cities = len(all_cities)
-        total_regions = max(1, len(all_regions))
+        total_regions = len(all_regions) if all_regions else (1 if total_cities > 0 else 0)
 
-        # === Шаг 4: Определяем выезды ===
-        # БАГФИКС v6.6-r2: trips = regions_count (не cities_count)
+        # === Шаг 3: Количество выездов ===
         if total_cities <= 1:
-            trips = 1
+            trips = 1 if total_cities == 1 else 0
         else:
-            trips = total_regions  # 1 выезд на регион, не на город
+            # Грубое, но рабочее правило: один выезд на регион + небольшой запас
+            trips = max(1, total_regions)
 
-        needs_manual_check = total_cities > 5 or total_regions > 1
+        needs_manual_check = total_cities > 5 or total_regions > 2
 
         logger.info(
-            f"[AddressParser] Адресов: {len(lines)}, городов: {total_cities}, "
-            f"регионов: {total_regions}, выездов: {trips}"
+            f"[AddressParser] Городов: {total_cities}, "
+            f"Регионов: {total_regions}, Выездов: {trips} | "
+            f"Города: {sorted(list(all_cities))[:8]}"
         )
-        if total_regions > 1:
-            logger.warning(
-                f"[AddressParser] Несколько регионов — требуется ручная проверка выездов"
-            )
 
         return {
             "cities_count": total_cities,
@@ -197,8 +208,8 @@ class AddressParser:
             return ""
 
         address = re.sub(r"^\d{6},?\s*", "", address)
-
         address_lower = address.lower()
+
         for region in RUSSIAN_REGIONS:
             if region.lower() in address_lower:
                 return region
@@ -206,7 +217,7 @@ class AddressParser:
         parts = address.split(",")
         if parts:
             first = parts[0].strip()
-            if first:
+            if first and not any(char.isdigit() for char in first):
                 return first
 
         return ""

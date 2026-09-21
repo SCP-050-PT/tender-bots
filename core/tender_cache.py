@@ -2,22 +2,22 @@
 Кэш тендеров на SQLite для TENDER-BOT.
 
 Особенности:
-- SQLite с WAL-режимом (потокобезопасность на чтение)
+- SQLite с WAL-режимом (потокобезопасность на чтение/запись)
 - Индексы по reg_number, checked_at, last_check
 - TTL + автоочистка старых записей
-- Отложенное сохранение (batch insert)
-- Потокобезопасность через threading.RLock
+- Отложенное сохранение (batch insert через executemany)
+- Потокобезопасность через threading.RLock и контекстный менеджер
 """
 
-import sqlite3
 import hashlib
+from pathlib import Path
+import sqlite3
 import threading
 import time
-from datetime import datetime, timedelta
-from pathlib import Path
-from typing import Dict, Optional, List, Any, Set, Tuple
-from dataclasses import dataclass, asdict, field
 from contextlib import contextmanager
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Set, Tuple
 from loguru import logger
 
 # ============================================================================
@@ -44,7 +44,6 @@ class PurchaseState:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "PurchaseState":
-        # Убираем лишние поля
         allowed = {f.name for f in cls.__dataclass_fields__.values()}
         filtered = {k: v for k, v in data.items() if k in allowed}
         return cls(**filtered)
@@ -59,7 +58,7 @@ class PurchaseState:
 
 @dataclass
 class TenderResult:
-    """Найденный тендер (аналог EvaderRecord)."""
+    """Найденный тендер."""
 
     reg_number: str
     protocol_date: str  # ДД.ММ.ГГГГ
@@ -98,14 +97,12 @@ class SearchSession:
 class TenderCache:
     """
     Единый SQLite-кэш для TENDER-BOT.
-
     Потокобезопасный, с WAL-режимом, индексами и автоочисткой.
     """
 
     DEFAULT_TTL_DAYS = 90
     DEFAULT_MAX_ENTRIES = 50000
     SAVE_BATCH_SIZE = 50
-    SAVE_DELAY_SECONDS = 5
 
     def __init__(
         self,
@@ -121,11 +118,21 @@ class TenderCache:
 
         self._lock = threading.RLock()
         self._pending_tenders: List[Tuple[str, str, str]] = []  # (reg, date, url)
-        self._pending_save = False
-        self._last_save_time = 0
+        self._last_save_time = time.time()
 
         self._init_db()
         self._cleanup_old_entries()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def close(self):
+        """Сбрасывает накопленный буфер при закрытии."""
+        self.flush()
+
     # ------------------------------------------------------------------------
     # DATABASE LAYER
     # ------------------------------------------------------------------------
@@ -192,8 +199,8 @@ class TenderCache:
 
     @contextmanager
     def _connection(self):
-        """Контекстный менеджер для соединения с БД."""
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        """Контекстный менеджер соединения с БД с защитой от блокировок."""
+        conn = sqlite3.connect(self.db_path, timeout=30.0, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         try:
             yield conn
@@ -205,7 +212,7 @@ class TenderCache:
             conn.close()
 
     # ------------------------------------------------------------------------
-    # PURCHASE STATES (из purchase_cache.py)
+    # PURCHASE STATES
     # ------------------------------------------------------------------------
 
     def get_purchase_state(self, reg_number: str) -> Optional[PurchaseState]:
@@ -280,16 +287,7 @@ class TenderCache:
         current_protocol_count: int = 0,
         current_protocols_hash: Optional[str] = None,
     ) -> bool:
-        """
-        Проверяет, нужно ли обновлять закупку.
-
-        Логика:
-        1. Нет в кэше → обновлять
-        2. Изменилась дата обновления → обновлять
-        3. Изменилось кол-во протоколов → обновлять
-        4. Изменился хеш протоколов → обновлять
-        5. is_empty=True и ничего не изменилось → НЕ обновлять
-        """
+        """Проверяет необходимость обновления закупки."""
         cached = self.get_purchase_state(reg_number)
 
         if not cached:
@@ -309,7 +307,7 @@ class TenderCache:
             return True
 
         if current_protocols_hash and cached.protocols_hash != current_protocols_hash:
-            logger.info(f"  🔄 Изменился хеш протоколов")
+            logger.info("  🔄 Изменился хеш протоколов")
             return True
 
         if cached.is_empty and cached.protocol_count == current_protocol_count:
@@ -362,10 +360,12 @@ class TenderCache:
             return hashlib.md5(b"error").hexdigest()[:16]
 
     # ------------------------------------------------------------------------
-    # TENDER RESULTS (из evaders_cache.py)
+    # TENDER RESULTS
     # ------------------------------------------------------------------------
 
-    def is_tender_processed(self, reg_number: str, protocol_date: str = None) -> bool:
+    def is_tender_processed(
+        self, reg_number: str, protocol_date: Optional[str] = None
+    ) -> bool:
         """Проверяет, обрабатывался ли тендер."""
         with self._lock:
             with self._connection() as conn:
@@ -391,7 +391,6 @@ class TenderCache:
         reg_number: str,
         protocol_date: str,
         purchase_url: str,
-        batch: bool = False,
     ) -> bool:
         """
         Добавляет тендер в кэш.
@@ -400,18 +399,16 @@ class TenderCache:
         now_iso = datetime.now().isoformat()
 
         with self._lock:
-            # Проверяем существование
             with self._connection() as conn:
                 existing = conn.execute(
                     """
-                    SELECT total_count, protocols_found FROM tender_results
+                    SELECT total_count FROM tender_results
                     WHERE reg_number = ? AND protocol_date = ?
                 """,
                     (reg_number, protocol_date),
                 ).fetchone()
 
                 if existing:
-                    # Обновляем существующий
                     conn.execute(
                         """
                         UPDATE tender_results
@@ -424,7 +421,6 @@ class TenderCache:
                     logger.debug(f"⏭ Тендер уже в кэше: {reg_number}")
                     return False
 
-                # Новый тендер
                 conn.execute(
                     """
                     INSERT INTO tender_results (
@@ -451,16 +447,11 @@ class TenderCache:
         protocol_date: str,
         purchase_url: str,
     ) -> bool:
-        """
-        Добавляет в буфер для batch-вставки.
-        Возвращает True если новый (ещё не в буфере и не в БД).
-        """
+        """Добавляет запись в буфер batch-вставки."""
         with self._lock:
-            # Проверяем в БД
             if self.is_tender_processed(reg_number, protocol_date):
                 return False
 
-            # Проверяем в буфере
             for r, d, _ in self._pending_tenders:
                 if r == reg_number and d == protocol_date:
                     return False
@@ -473,39 +464,32 @@ class TenderCache:
             return True
 
     def _flush_batch(self):
-        """Сбрасывает буфер в БД."""
+        """Сбрасывает накопившийся буфер в БД за одну транзакцию."""
         if not self._pending_tenders:
             return
 
         now_iso = datetime.now().isoformat()
         with self._lock:
+            batch_data = [(r, d, u, d, 1, now_iso) for r, d, u in self._pending_tenders]
             with self._connection() as conn:
-                for reg_number, protocol_date, purchase_url in self._pending_tenders:
-                    try:
-                        conn.execute(
-                            """
-                            INSERT INTO tender_results (
-                                reg_number, protocol_date, purchase_url,
-                                first_found_date, total_count, last_check
-                            ) VALUES (?, ?, ?, ?, ?, ?)
-                        """,
-                            (
-                                reg_number,
-                                protocol_date,
-                                purchase_url,
-                                protocol_date,
-                                1,
-                                now_iso,
-                            ),
-                        )
-                    except sqlite3.IntegrityError:
-                        pass  # Уже есть
+                conn.executemany(
+                    """
+                    INSERT OR IGNORE INTO tender_results (
+                        reg_number, protocol_date, purchase_url,
+                        first_found_date, total_count, last_check
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                    batch_data,
+                )
 
             count = len(self._pending_tenders)
             self._pending_tenders.clear()
+            self._last_save_time = time.time()
             logger.debug(f"💾 Batch сохранён: {count} тендеров")
 
-    def get_tender(self, reg_number: str, protocol_date: str = None) -> Optional[Dict]:
+    def get_tender(
+        self, reg_number: str, protocol_date: Optional[str] = None
+    ) -> Optional[Dict]:
         """Возвращает запись о тендере."""
         with self._lock:
             with self._connection() as conn:
@@ -525,12 +509,10 @@ class TenderCache:
                         (reg_number,),
                     ).fetchone()
 
-                if row:
-                    return dict(row)
-                return None
+                return dict(row) if row else None
 
     def get_all_reg_numbers(self) -> Set[str]:
-        """Все reg_number из кэша тендеров."""
+        """Все reg_number из таблицы tender_results."""
         with self._lock:
             with self._connection() as conn:
                 rows = conn.execute(
@@ -553,11 +535,11 @@ class TenderCache:
                 return [dict(r) for r in rows]
 
     # ------------------------------------------------------------------------
-    # SEARCH SESSIONS (аналитика)
+    # SEARCH SESSIONS
     # ------------------------------------------------------------------------
 
     def save_search_session(self, session: SearchSession) -> int:
-        """Сохраняет сессию поиска, возвращает ID."""
+        """Сохраняет сессию поиска и возвращает ее ID."""
         now = datetime.now().isoformat()
         with self._lock:
             with self._connection() as conn:
@@ -583,7 +565,7 @@ class TenderCache:
                 return cursor.lastrowid
 
     def get_search_stats(self, days: int = 30) -> List[Dict]:
-        """Статистика поисков за период."""
+        """Статистика поисковых сессий."""
         cutoff = (datetime.now() - timedelta(days=days)).isoformat()
         with self._lock:
             with self._connection() as conn:
@@ -610,23 +592,13 @@ class TenderCache:
 
         with self._lock:
             with self._connection() as conn:
-                # Очищаем purchase_states
-                result = conn.execute(
-                    """
-                    DELETE FROM purchase_states WHERE checked_at < ?
-                """,
-                    (cutoff,),
-                )
-                ps_deleted = result.rowcount
+                ps_deleted = conn.execute(
+                    "DELETE FROM purchase_states WHERE checked_at < ?", (cutoff,)
+                ).rowcount
 
-                # Очищаем tender_results
-                result = conn.execute(
-                    """
-                    DELETE FROM tender_results WHERE last_check < ?
-                """,
-                    (cutoff,),
-                )
-                tr_deleted = result.rowcount
+                tr_deleted = conn.execute(
+                    "DELETE FROM tender_results WHERE last_check < ?", (cutoff,)
+                ).rowcount
 
             total = ps_deleted + tr_deleted
             if total > 0:
@@ -636,16 +608,14 @@ class TenderCache:
                 )
 
     def _enforce_max_entries(self):
-        """Удаляет самые старые записи если превышен лимит."""
+        """Удаляет старейшие записи при превышении лимита."""
         with self._lock:
             with self._connection() as conn:
-                # Проверяем purchase_states
-                count = conn.execute("SELECT COUNT(*) FROM purchase_states").fetchone()[
-                    0
-                ]
-
-                if count > self.max_entries:
-                    to_remove = count - self.max_entries
+                count_ps = conn.execute(
+                    "SELECT COUNT(*) FROM purchase_states"
+                ).fetchone()[0]
+                if count_ps > self.max_entries:
+                    to_remove = count_ps - self.max_entries
                     conn.execute(
                         """
                         DELETE FROM purchase_states
@@ -661,13 +631,11 @@ class TenderCache:
                         f"🧹 Удалено {to_remove} purchase_states (лимит {self.max_entries})"
                     )
 
-                # Проверяем tender_results
-                count = conn.execute("SELECT COUNT(*) FROM tender_results").fetchone()[
-                    0
-                ]
-
-                if count > self.max_entries:
-                    to_remove = count - self.max_entries
+                count_tr = conn.execute(
+                    "SELECT COUNT(*) FROM tender_results"
+                ).fetchone()[0]
+                if count_tr > self.max_entries:
+                    to_remove = count_tr - self.max_entries
                     conn.execute(
                         """
                         DELETE FROM tender_results
@@ -684,13 +652,13 @@ class TenderCache:
                     )
 
     def flush(self):
-        """Принудительно сбрасывает буфер и сохраняет всё."""
+        """Принудительный сброс буфера на диск."""
         with self._lock:
             self._flush_batch()
         logger.debug("💾 Кэш принудительно сброшен")
 
     def clear_all(self):
-        """Полная очистка кэша."""
+        """Полная очистка кэша и сжатие БД."""
         with self._lock:
             with self._connection() as conn:
                 conn.execute("DELETE FROM purchase_states")
@@ -701,7 +669,7 @@ class TenderCache:
         logger.warning("🗑️ Кэш полностью очищен")
 
     def remove_purchase(self, reg_number: str) -> bool:
-        """Удаляет закупку из кэша."""
+        """Удаляет конкретную закупку из кэша."""
         with self._lock:
             with self._connection() as conn:
                 result = conn.execute(
@@ -714,7 +682,7 @@ class TenderCache:
     # ------------------------------------------------------------------------
 
     def get_stats(self) -> Dict[str, Any]:
-        """Общая статистика кэша."""
+        """Статистика БД и объёма закупленных данных."""
         with self._lock:
             with self._connection() as conn:
                 ps_total = conn.execute(

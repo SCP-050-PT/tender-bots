@@ -2,20 +2,24 @@
 core/document_processor.py
 Фасад для обработки документов тендера.
 
-v7.8.1:
-  - Добавлена поддержка tender_id для корректной работы MCP-сервера.
-  - Файлы сохраняются с префиксом {tender_id}_, чтобы MCP мог их находить.
-  - Улучшен вывод данных из Excel-only файлов (добавлены заголовки и контекст).
-  - Исправлена логика определения расширений и валидации контента.
+v7.8.2:
+  - Исправлена повторная проверка размера контракта ПОСЛЕ скачивания.
+  - Исправлена коллизия имён файлов при скачивании в одну секунду (uuid/ns).
+  - Отключены предупреждения urllib3 для InsecureRequest.
 """
 
 import os
 import re
 import time
+import uuid
 from pathlib import Path
 from typing import List, Dict, Optional
 from dataclasses import dataclass
 from loguru import logger
+import urllib3
+
+# Отключаем предупреждения о необрабатываемых SSL-сертификатах
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from core.config.document_config import (
     CONTRACT_PATTERNS,
@@ -59,6 +63,7 @@ class DocumentInfo:
             "date": self.date,
             "is_active": self.is_active,
             "file_url": self.file_url,
+            "file_size_bytes": self.file_size_bytes,
             "is_contract": self.is_contract,
             "priority": self.priority,
         }
@@ -68,17 +73,15 @@ class DocumentProcessor:
     """Фасад для обработки документов тендера."""
 
     def __init__(self, download_dir: Optional[Path] = None, session=None):
-        # v7.8.1: Используем абсолютный путь к папке downloads внутри core
         self.download_dir = (
             download_dir or Path(__file__).resolve().parent / "downloads"
         )
         self.download_dir.mkdir(parents=True, exist_ok=True)
         self.session = session
 
-        # v6.8.6: Инициализация экстракторов
         self._extractors = {
             "docx": DocxExtractor(),
-            "doc": DocxExtractor(),
+            "doc": DocxExtractor(),  # Предполагается, что DocxExtractor обрабатывает и .doc (или конвертирует)
             "pdf": PdfExtractor(),
             "xlsx": ExcelExtractor(),
             "xls": ExcelExtractor(),
@@ -92,13 +95,10 @@ class DocumentProcessor:
         self,
         documents: List[DocumentInfo],
         max_docs: int = 5,
-        tender_id: str = "",  # v7.8.1: Добавлен параметр tender_id
+        tender_id: str = "",
     ) -> str:
         """
         Обрабатывает список документов тендера.
-        v7.8.1: Принимает tender_id для корректного именования файлов при скачивании.
-        v7.2.2: Фильтрация по чёрному списку + Excel-only файлы.
-        Возвращает объединённый текст для анализа.
         """
         if not documents:
             logger.warning("[DocumentProcessor] Нет документов для обработки")
@@ -114,13 +114,13 @@ class DocumentProcessor:
             doc.is_contract = self._is_contract_file(doc.name)
             doc.priority = self._get_file_priority(doc.name)
 
-            # v7.2.2: Чёрный список
+            # Чёрный список
             if self._should_skip_file(doc.name):
                 skipped_docs.append(doc)
                 logger.info(f"[DocumentProcessor] Пропуск (чёрный список): {doc.name}")
                 continue
 
-            # v7.2.2: Excel-only (извлекаем qty/price, но не в LLM)
+            # Excel-only
             if self._is_excel_only(doc.name):
                 excel_only_docs.append(doc)
                 logger.info(f"[DocumentProcessor] Excel-only: {doc.name}")
@@ -146,13 +146,12 @@ class DocumentProcessor:
             f"excel-only: {len(excel_only_docs)})"
         )
 
-        # v7.8.1: Обрабатываем Excel-only файлы с передачей tender_id
+        # Обрабатываем Excel-only файлы
         structured_parts = []
         for doc in excel_only_docs:
             try:
                 text = self._process_single_document(doc, tender_id=tender_id)
                 if text:
-                    # Только первые 2000 символов (qty + price), не полный текст
                     structured_parts.append(text[:2000])
                     logger.info(
                         f"[DocumentProcessor] Excel-only извлечено: {doc.name} "
@@ -194,7 +193,6 @@ class DocumentProcessor:
         return result
 
     def _is_contract_file(self, filename: str) -> bool:
-        """Проверяет, является ли файл контрактом/договором."""
         if not filename:
             return False
         name_lower = filename.lower()
@@ -204,7 +202,6 @@ class DocumentProcessor:
         return False
 
     def _should_skip_file(self, filename: str) -> bool:
-        """v7.2.2: Проверяет, нужно ли пропустить файл (экономия токенов)."""
         if not filename:
             return False
         name_lower = filename.lower()
@@ -215,7 +212,6 @@ class DocumentProcessor:
         return False
 
     def _is_excel_only(self, filename: str) -> bool:
-        """v7.2.2: Файл только для Excel-извлечения, не для LLM."""
         if not filename:
             return False
         name_lower = filename.lower()
@@ -225,7 +221,6 @@ class DocumentProcessor:
         return False
 
     def _get_file_priority(self, filename: str) -> int:
-        """Определяет приоритет файла по названию."""
         if not filename:
             return 0
         name_lower = filename.lower()
@@ -236,22 +231,30 @@ class DocumentProcessor:
         return max_priority
 
     def _process_single_document(self, doc: DocumentInfo, tender_id: str = "") -> str:
-        """Обрабатывает один документ. v7.8.1: принимает tender_id."""
-        # Пропускаем большие контракты
+        """Обрабатывает один документ."""
+        # Быстрая проверка до скачивания (если размер уже известен)
         if doc.is_contract and doc.file_size_bytes > MAX_CONTRACT_FILE_SIZE:
             logger.info(f"[DocumentProcessor] Пропущен (контракт >200 KB): {doc.name}")
             return ""
 
-        # Скачиваем (передаем tender_id для правильного именования)
+        # Скачиваем
         file_path = self._download_file(doc, tender_id=tender_id)
         if not file_path:
+            return ""
+
+        # Повторная проверка размера контракта после того, как файл был действительно скачан
+        if doc.is_contract and doc.file_size_bytes > MAX_CONTRACT_FILE_SIZE:
+            logger.info(
+                f"[DocumentProcessor] Пропущен после скачивания (контракт {doc.file_size_bytes} байт > limit): {doc.name}"
+            )
+            file_path.unlink(missing_ok=True)  # Удаляем ненужный скачанный файл
             return ""
 
         # Валидируем содержимое
         if not self._validate_file_content(file_path, doc.file_type):
             return ""
 
-        # Извлекаем текст через подходящий экстрактор
+        # Извлекаем текст
         text = self._extract_text(file_path, doc.file_type, doc.name)
         if not text:
             return ""
@@ -269,10 +272,6 @@ class DocumentProcessor:
         return text
 
     def _download_file(self, doc: DocumentInfo, tender_id: str = "") -> Optional[Path]:
-        """
-        Скачивает файл с правильным расширением.
-        v7.8.1: Добавляет tender_id в начало имени файла для MCP-сервера.
-        """
         if not doc.file_url:
             return None
 
@@ -298,35 +297,22 @@ class DocumentProcessor:
             content_length = len(response.content)
             doc.file_size_bytes = content_length
 
-            # === БАГФИКС v6.8.6: корректное расширение ===
             safe_name = re.sub(r"[^\w\-_.]", "_", doc.name)[:80]
 
-            # Пытаемся получить расширение из имени файла
             ext = Path(doc.name).suffix.lower()
 
-            # Если расширения нет — пробуем определить по Content-Type
             if not ext:
                 content_type = response.headers.get("Content-Type", "").lower()
                 ext = self._ext_from_content_type(content_type, doc.file_type)
 
-            # Если всё ещё нет — по magic bytes из содержимого
             if not ext:
                 ext = self._ext_from_magic(response.content[:8])
 
-            # v7.8.1: Формируем имя файла с tender_id для MCP
             prefix = f"{tender_id}_" if tender_id else ""
+            # Уникальный суффикс из наносекунд и короткого hash/uuid от коллизий
+            unique_suffix = f"{int(time.time())}_{uuid.uuid4().hex[:4]}"
 
-            if ext:
-                file_path = (
-                    self.download_dir / f"{prefix}{safe_name}_{int(time.time())}{ext}"
-                )
-            else:
-                file_path = (
-                    self.download_dir / f"{prefix}{safe_name}_{int(time.time())}"
-                )
-                logger.warning(
-                    f"[DocumentProcessor] Не удалось определить расширение для {doc.name}"
-                )
+            file_path = self.download_dir / f"{prefix}{safe_name}_{unique_suffix}{ext}"
 
             with open(file_path, "wb") as f:
                 f.write(response.content)
@@ -339,7 +325,6 @@ class DocumentProcessor:
             return None
 
     def _ext_from_content_type(self, content_type: str, file_type: str) -> str:
-        """Определяет расширение по Content-Type."""
         mapping = {
             "application/pdf": ".pdf",
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
@@ -353,7 +338,6 @@ class DocumentProcessor:
         for ct, ext in mapping.items():
             if ct in content_type:
                 return ext
-        # Fallback на file_type
         if file_type:
             ft = file_type.lower().lstrip(".")
             if ft in ["pdf", "docx", "doc", "xlsx", "xls", "zip", "txt", "rtf"]:
@@ -361,7 +345,6 @@ class DocumentProcessor:
         return ""
 
     def _ext_from_magic(self, header: bytes) -> str:
-        """Определяет расширение по магическим байтам."""
         if header.startswith(PDF_MAGIC):
             return ".pdf"
         elif header.startswith(ZIP_MAGIC):
@@ -373,7 +356,6 @@ class DocumentProcessor:
         return ""
 
     def _validate_file_content(self, file_path: Path, file_type: str) -> bool:
-        """Проверяет, что файл соответствует заявленному типу."""
         try:
             with open(file_path, "rb") as f:
                 header = f.read(8)
@@ -397,7 +379,7 @@ class DocumentProcessor:
             elif ext in ["zip", "docx", "xlsx"]:
                 if not header.startswith(ZIP_MAGIC):
                     logger.error(
-                        f"[DocumentProcessor]  {file_path.name} — не ZIP (magic: {header[:4].hex()})"
+                        f"[DocumentProcessor] 🔴 {file_path.name} — не ZIP (magic: {header[:4].hex()})"
                     )
                     return False
 
@@ -407,16 +389,13 @@ class DocumentProcessor:
             return False
 
     def _extract_text(self, file_path: Path, file_type: str, doc_name: str) -> str:
-        """Делегирует извлечение подходящему экстрактору."""
         ext = file_type.lower() if file_type else file_path.suffix.lower()
         ext = ext.lstrip(".")
 
-        # Пробуем найти экстрактор по расширению
         extractor = self._extractors.get(ext)
         if extractor:
             return extractor.extract(file_path, doc_name)
 
-        # Если не нашли — определяем по содержимому
         detected_ext = self._detect_file_type(file_path)
         extractor = self._extractors.get(detected_ext)
         if extractor:
@@ -430,7 +409,6 @@ class DocumentProcessor:
         return ""
 
     def _detect_file_type(self, file_path: Path) -> str:
-        """Определяет тип файла по магическим байтам."""
         try:
             with open(file_path, "rb") as f:
                 header = f.read(8)

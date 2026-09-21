@@ -1,15 +1,21 @@
 """
 Единый сервис fallback-оценок по НМЦК.
 Заменяет: analyzer FALLBACK sout/plk/education, llm_wrapper._fallback_estimate().
+
+ИСПРАВЛЕНО:
+  - Тип 'testing' вынесен в общий словарь COEFFICIENTS во избежание магии чисел.
+  - Улучшена безопасность деления.
 """
 
 from typing import Dict, Any, Optional
+from datetime import datetime
 from loguru import logger
 
 # === ЕДИНСТВЕННЫЙ источник коэффициентов ===
 COEFFICIENTS = {
     "sout": {"price_per_unit": 1200, "unit_name": "РМ"},
     "plk": {"price_per_unit": 170, "unit_name": "точек"},
+    "testing": {"price_per_unit": 170, "unit_name": "точек"},
     "education": {"price_per_unit": 2500, "unit_name": "слушателей"},
     "opr": {"price_per_unit": 500, "unit_name": "должностей"},
 }
@@ -18,7 +24,7 @@ COEFFICIENTS = {
 class FallbackService:
     """Оценка параметров по НМЦК когда LLM/КТРУ не дали данных."""
 
-    VERSION = "v7.1.0"
+    VERSION = "v7.1.1"
 
     @staticmethod
     def apply(tender_info: Dict[str, Any], tender_type: str) -> Dict[str, Any]:
@@ -30,20 +36,6 @@ class FallbackService:
         if nmck <= 0:
             return tender_info
 
-        # v7.1.0: Testing — обрабатываем ДО проверки COEFFICIENTS,
-        # т.к. "testing" нет в словаре COEFFICIENTS
-        if tender_type == "testing":
-            if not tender_info.get("measurement_points"):
-                estimated_points = int(round(nmck / 170))
-                if estimated_points > 0:
-                    tender_info["measurement_points"] = estimated_points
-                    tender_info["measurement_points_source"] = "nmck_estimate_testing"
-                    logger.info(
-                        f"[{FallbackService.VERSION}] FALLBACK testing: "
-                        f"estimated_points={estimated_points} (НМЦК {nmck:,.0f} / 170)"
-                    )
-            return tender_info
-
         coeff = COEFFICIENTS.get(tender_type)
         if not coeff:
             return tender_info
@@ -51,6 +43,7 @@ class FallbackService:
         price_per_unit = coeff["price_per_unit"]
         unit_name = coeff["unit_name"]
 
+        # --- 1. SOUT ---
         if tender_type == "sout" and not tender_info.get("rm_total"):
             estimated = int(round(nmck / price_per_unit))
             if estimated > 0:
@@ -61,6 +54,7 @@ class FallbackService:
                     f"estimated_rm={estimated} (НМЦК {nmck:,.0f} / {price_per_unit})"
                 )
 
+        # --- 2. PLK ---
         elif tender_type == "plk" and not tender_info.get("measurement_points"):
             estimated = int(round(nmck / price_per_unit))
             if estimated > 0:
@@ -71,8 +65,19 @@ class FallbackService:
                     f"estimated_points={estimated} (НМЦК {nmck:,.0f} / {price_per_unit})"
                 )
 
+        # --- 3. TESTING ---
+        elif tender_type == "testing" and not tender_info.get("measurement_points"):
+            estimated = int(round(nmck / price_per_unit))
+            if estimated > 0:
+                tender_info["measurement_points"] = estimated
+                tender_info["measurement_points_source"] = "nmck_estimate_testing"
+                logger.info(
+                    f"[{FallbackService.VERSION}] FALLBACK testing: "
+                    f"estimated_points={estimated} (НМЦК {nmck:,.0f} / {price_per_unit})"
+                )
+
+        # --- 4. EDUCATION ---
         elif tender_type == "education":
-            # Education: programs[] → scalar conversion
             programs = tender_info.get("programs")
             if programs and not tender_info.get("students_count"):
                 total_unit_sum = tender_info.get("total_unit_price_sum")
@@ -96,8 +101,6 @@ class FallbackService:
                     contract_end = tender_info.get("contract_end_date")
                     if contract_end and not tender_info.get("contract_months"):
                         try:
-                            from datetime import datetime
-
                             end_date = datetime.strptime(str(contract_end), "%Y-%m-%d")
                             now = datetime.now()
                             months = max(
@@ -136,6 +139,7 @@ class FallbackService:
                         f"(НМЦК {nmck:,.0f} / {price_per_unit})"
                     )
 
+        # --- 5. OPR ---
         elif tender_type == "opr" and not tender_info.get("opr_positions"):
             estimated = int(round(nmck / price_per_unit))
             if estimated > 0:

@@ -1,6 +1,12 @@
-# utils/formatters.py
+"""
+utils/formatters.py
+Вспомогательные функции для форматирования данных, дат, текста для Google Sheets и логирования.
+Версия: v7.8.0
+"""
+
 import re
 from datetime import datetime
+from typing import Any, Dict, Optional
 from loguru import logger
 
 
@@ -33,15 +39,14 @@ def parse_deadline_to_days(deadline_date_str: str) -> int:
 
 
 def sanitize_for_sheets(text: str) -> str:
-    """Заменяет эмодзи на текстовые маркеры для Google Sheets."""
+    """Заменяет эмодзи на текстовые маркеры для Google Sheets во избежание сбоев кодировки."""
     if not isinstance(text, str):
         return str(text) if text is not None else ""
 
-    # Исправлено: убраны пустые ключи и невидимые символы, которые ломали текст
     replacements = {
         "🟢": "[LOW]",
         "🟡": "[MED]",
-        "🔴": "[HIGH]",  # Добавлен явный красный круг
+        "🔴": "[HIGH]",
         "⚠️": "[WARN]",
         "✅": "[OK]",
         "⛔": "[FORBIDDEN]",
@@ -57,7 +62,6 @@ def sanitize_for_sheets(text: str) -> str:
     for emoji, replacement in replacements.items():
         result = result.replace(emoji, replacement)
 
-    # Удаляем остальные эмодзи, которые не попали в список замены
     emoji_pattern = re.compile(
         "["
         "\U0001f600-\U0001f64f"  # emoticons
@@ -74,8 +78,8 @@ def sanitize_for_sheets(text: str) -> str:
     return result
 
 
-def get_quantity(analysis) -> int:
-    """Извлекает количество из анализа с fallback по НМЦК."""
+def get_quantity(analysis: Any) -> int:
+    """Извлекает итоговое количество (РМ/слушателей/точек) из объекта анализа."""
     if not hasattr(analysis, "details") or analysis.details is None:
         return 1
 
@@ -97,24 +101,24 @@ def get_quantity(analysis) -> int:
             or getattr(details, "opr_positions", None)
         )
 
-    if quantity and quantity > 0:
+    if quantity and int(quantity) > 0:
         return int(quantity)
 
-    # Fallback по НМЦК
+    # Fallback расчет по НМЦК, если парсер не вытащил точное количество
     nmck = getattr(analysis, "nmck", 0) or 0
     ttype = getattr(analysis, "tender_type", "")
     if nmck > 0 and ttype:
         divisors = {"sout": 1200, "plk": 500, "opr": 700, "education": 1500}
         divisor = divisors.get(ttype, 1000)
         estimated = int(nmck / divisor)
-        logger.debug(f"[P1-4] Fallback quantity для {ttype}: {estimated}")
+        logger.debug(f"[Fallback] Количество для {ttype}: {estimated}")
         return estimated
 
     return 1
 
 
-def build_calculation_breakdown(analysis) -> str:
-    """Формирует разбивку расчётов для колонки Q (адаптировано под v7.8.0)."""
+def build_calculation_breakdown(analysis: Any) -> str:
+    """Формирует детальную разбивку расчётов для колонки Q (Расчёты)."""
     if not hasattr(analysis, "details") or analysis.details is None:
         return ""
 
@@ -124,19 +128,17 @@ def build_calculation_breakdown(analysis) -> str:
         if isinstance(d, dict)
         else {k: getattr(d, k, None) for k in dir(d) if not k.startswith("_")}
     )
-    tender_type = details.get("type", analysis.tender_type)
+    tender_type = details.get("type", getattr(analysis, "tender_type", ""))
     lines = []
 
     # === СОУТ ===
     if tender_type == "sout":
         lines.append("СОУТ (Единая формула)")
-
         rm_source = details.get("rm_total_source", "из ТЗ")
         rm_count = details.get("rm_total", "?")
         lines.append(
             f"РМ всего: {rm_count} ({rm_source}) × {details.get('base_rate_per_rm', 213)}₽"
         )
-
         lines.append(f"База: {details.get('main_calculation', 0):,.0f}₽")
         lines.append(f"Материалы: {details.get('materials_cost', 0):,.0f}₽")
         lines.append(f"Доставка: {details.get('delivery_cost', 0):,.0f}₽")
@@ -166,7 +168,6 @@ def build_calculation_breakdown(analysis) -> str:
         lines.append(
             f"Обучение | {'Дистант' if details.get('is_distance') else 'Очно'}"
         )
-
         students_source = details.get("students_count_source", "из ТЗ")
         lines.append(
             f"Слушателей: {details.get('students_count', '?')} ({students_source})"
@@ -192,11 +193,9 @@ def build_calculation_breakdown(analysis) -> str:
     # === ОПР ===
     elif tender_type == "opr":
         lines.append("ОПР (Оценка проф. рисков)")
-
         positions_source = details.get("opr_positions_source", "из ТЗ")
         positions = details.get("opr_positions", details.get("positions_count", "?"))
         lines.append(f"Должностей: {positions} ({positions_source})")
-
         lines.append(f"База (работы): {details.get('position_cost', 0):,.0f}₽")
         lines.append(f"Материалы: {details.get('materials_cost', 0):,.0f}₽")
         lines.append(f"Доставка: {details.get('delivery_cost', 0):,.0f}₽")
@@ -220,11 +219,9 @@ def build_calculation_breakdown(analysis) -> str:
     # === ПЛК ===
     elif tender_type == "plk":
         lines.append("ПЛК (Производственный контроль)")
-
         points_source = details.get("points_source", "из ТЗ")
         points = details.get("points_count", "?")
         lines.append(f"Точек замеров: {points} ({points_source})")
-
         lines.append(
             f"База (замеры): {details.get('points_cost', 0) + details.get('measurer_cost', 0):,.0f}₽"
         )
@@ -244,15 +241,15 @@ def build_calculation_breakdown(analysis) -> str:
             if daily > 0:
                 lines.append(f"  Суточные: {daily:,.0f}₽")
         else:
-            lines.append(f"Транспорт: 0₽ (1 адрес или нет данных)")
+            lines.append("Транспорт: 0₽ (1 адрес или нет данных)")
 
     else:
         lines.append(f"[?] Тип: {tender_type}")
 
     lines.append("──────────────")
-    lines.append(f"Себестоимость: {analysis.cost_price:,.0f}₽")
-    lines.append(f"Маржа: {analysis.margin_percent:.1f}%")
-    lines.append(f"Цена: {analysis.recommended_price:,.0f}₽")
+    lines.append(f"Себестоимость: {getattr(analysis, 'cost_price', 0):,.0f}₽")
+    lines.append(f"Маржа: {getattr(analysis, 'margin_percent', 0):.1f}%")
+    lines.append(f"Цена: {getattr(analysis, 'recommended_price', 0):,.0f}₽")
 
     if hasattr(analysis, "review_reason") and analysis.review_reason:
         lines.append(f"⚠️ {analysis.review_reason}")
@@ -260,17 +257,18 @@ def build_calculation_breakdown(analysis) -> str:
     return "\n".join(lines)
 
 
-def build_short_recommendation(analysis) -> str:
-    """Краткая рекомендация для колонки S (без эмодзи)."""
+def build_short_recommendation(analysis: Any) -> str:
+    """Формирует сжатую рекомендацию для колонки S (Рекомендации)."""
     parts = [
-        f"Тип: {analysis.tender_type}",
-        f"Себестоимость: {analysis.cost_price:,.0f} ₽",
-        f"Рекомендуемая цена: {analysis.recommended_price:,.0f} ₽",
-        f"Маржа: {analysis.margin_percent:.1f}%",
+        f"Тип: {getattr(analysis, 'tender_type', 'unknown')}",
+        f"Себестоимость: {getattr(analysis, 'cost_price', 0):,.0f} ₽",
+        f"Рекомендуемая цена: {getattr(analysis, 'recommended_price', 0):,.0f} ₽",
+        f"Маржа: {getattr(analysis, 'margin_percent', 0):.1f}%",
     ]
 
+    risk = getattr(analysis, "risk_level", "low")
     risk_label = {"low": "[LOW]", "medium": "[MED]", "high": "[HIGH]"}.get(
-        analysis.risk_level, "[UNKNOWN]"
+        risk, "[UNKNOWN]"
     )
     parts.append(f"Риск: {risk_label}")
 
@@ -278,3 +276,15 @@ def build_short_recommendation(analysis) -> str:
         parts.append(f"[WARN] {len(analysis.guard_violations)} нарушений лимитов")
 
     return " | ".join(parts)
+
+
+def log_pipeline_summary(stats: Dict[str, int]) -> None:
+    """Печатает красивую итоговую статистику выполнения скрипта в консоль."""
+    logger.info("=" * 60)
+    logger.info("📊 ИТОГИ ВЫПОЛНЕНИЯ ПАЙПЛАЙНА:")
+    logger.info(f"   • Всего найдено закупок:     {stats.get('total', 0)}")
+    logger.info(f"   • Успешно обработано:       {stats.get('processed', 0)}")
+    logger.info(f"   • Пропущено (дубликаты/фильтры): {stats.get('skipped', 0)}")
+    logger.info(f"   • Записано в Google Sheets: {stats.get('added_to_sheets', 0)}")
+    logger.info(f"   • Ошибок обработки:         {stats.get('errors', 0)}")
+    logger.info("=" * 60)

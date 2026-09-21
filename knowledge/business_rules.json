@@ -1,10 +1,45 @@
 {
-  "version": "1.1.0",
+  "version": "1.2.0",
+  "updated": "2026-09-16",
+  "search_parameters": {
+    "min_nmck": 100000,
+    "regions": "РФ (все субъекты)",
+    "okpd2_codes": [
+      "85.59.10",
+      "71.20.19",
+      "71.20.11",
+      "85.42"
+    ]
+  },
+  "minimum_offer_thresholds": {
+    "education_distance": 10000,
+    "sout": 20000,
+    "plk": 15000,
+    "opr": 15000,
+    "min_margin_services_percent": 10,
+    "min_margin_goods_percent": 5
+  },
+  "goods_supply_limits": {
+    "max_nmck": 300000,
+    "min_margin_percent": 5,
+    "categories": [
+      "СИЗ",
+      "аптечки",
+      "огнетушители",
+      "знаки безопасности"
+    ]
+  },
+  "financial_and_travel_rules": {
+    "daily_allowance_rub": 500,
+    "app_guarantee_bg_threshold_rub": 15000,
+    "contract_guarantee_bg_threshold_rub": 5000,
+    "bg_min_cost_rub": 1000
+  },
   "forbidden_directions": [
     {
       "id": "mchs_license",
       "name": "Лицензия МЧС на пожарную безопасность",
-      "keywords": ["лицензия мчс", "пожарная лицензия"],
+      "keywords": ["лицензия мчс", "пожарная лицензия", "монтаж систем пожаротушения"],
       "action": "reject",
       "reason": "Нет лицензии МЧС"
     },
@@ -13,21 +48,23 @@
       "name": "Экспертиза промышленной безопасности",
       "keywords": ["экспертиза промышленной безопасности", "эпб"],
       "action": "reject",
-      "reason": "Нет аккредитации на экспертизу промбезопасности"
+      "reason": "Нет аккредитации на экспертизу промбезопасности",
+      "exception": "Разрешено проведение СОУТ и ОПР на объектах ОПО"
     },
     {
       "id": "prom_bez_general",
       "name": "Промбезопасность (общее)",
       "keywords": ["промбезопасность", "промышленная безопасность"],
       "action": "reject",
-      "reason": "Требуется лицензия Ростехнадзора"
+      "reason": "Требуется лицензия Ростехнадзора",
+      "exception": "Разрешено проведение СОУТ и ОПР на объектах ОПО"
     },
     {
       "id": "med_workers",
       "name": "Медицинские работники",
-      "keywords": ["медицинские работники", "медперсонал"],
+      "keywords": ["медицинские работники", "медперсонал", "медосмотры"],
       "action": "reject",
-      "reason": "Не работаем с медицинскими профилями"
+      "reason": "Не работаем с медицинскими профилями и медосмотрами"
     },
     {
       "id": "info_security",
@@ -35,12 +72,12 @@
       "keywords": ["информационная безопасность", "иб", "кибербезопасность"],
       "action": "reject",
       "reason": "Нет компетенций в ИБ",
-      "exception": "Допустимо только в контексте СОУТ/ОПР"
+      "exception": "Допустимо только в контексте оценки условий труда (СОУТ/ОПР)"
     },
     {
       "id": "driver_license",
       "name": "Водительские права",
-      "keywords": ["водительские права", "обучение вождению"],
+      "keywords": ["водительские права", "обучение вождению", "автошкола"],
       "action": "reject",
       "reason": "Не выдаём водительские права"
     },
@@ -54,14 +91,14 @@
     {
       "id": "armed_guards",
       "name": "Охранники с оружием",
-      "keywords": ["охранники с оружием", "чоп"],
+      "keywords": ["охранники с оружием", "чоп", "охранная деятельность"],
       "action": "reject",
       "reason": "Требуется лицензия ЧОП"
     },
     {
       "id": "tech_diagnostics",
       "name": "Техническая диагностика оборудования",
-      "keywords": ["техническая диагностика", "дефектоскопия", "ндт"],
+      "keywords": ["техническая диагностика", "дефектоскопия", "ндт", "неразрушающий контроль"],
       "action": "reject",
       "reason": "Требуется лицензия Ростехнадзора"
     },
@@ -71,22 +108,57 @@
       "keywords": ["исследование воды", "питьевая вода", "смывы", "гельминты", "биология", "микробиология"],
       "action": "reject",
       "reason": "Нет аккредитации на биологические и химические анализы воды"
+    },
+    {
+      "id": "mixed_lot_forbidden",
+      "name": "Смешанный лот с запрещенным направлением",
+      "condition": "has_forbidden_direction_in_mixed_lot == true",
+      "action": "reject",
+      "reason": "Закупка содержит хотя бы одну запрещенную программу/услугу"
     }
   ],
   "red_flags": [
     {
-      "id": "low_margin",
-      "name": "Маржа ниже минимума",
-      "condition": "margin_percent < 10",
+      "id": "nmck_below_minimum",
+      "name": "НМЦК ниже 100 000 руб.",
+      "condition": "nmck < 100000",
       "level": "high",
-      "message": "Маржа ниже 10% — риск убыточности"
+      "message": "НМЦК меньше 100 000 ₽ — автоматическое отсеивание"
+    },
+    {
+      "id": "goods_nmck_exceeded",
+      "name": "НМЦК на СИЗ/товары выше 300 000 руб.",
+      "condition": "category == 'goods' AND nmck > 300000",
+      "level": "high",
+      "message": "Поставка товаров/СИЗ превышает лимит 300 000 ₽"
+    },
+    {
+      "id": "low_margin_services",
+      "name": "Маржа на услуги ниже 10%",
+      "condition": "category != 'goods' AND margin_percent < 10",
+      "level": "high",
+      "message": "Маржа на услуги ниже 10% — риск убыточности"
+    },
+    {
+      "id": "low_margin_goods",
+      "name": "Маржа на товары ниже 5%",
+      "condition": "category == 'goods' AND margin_percent < 5",
+      "level": "high",
+      "message": "Маржа на поставку СИЗ/товаров ниже допустимых 5%"
+    },
+    {
+      "id": "below_min_offer_price",
+      "name": "Цена предложения ниже минимальной",
+      "condition": "calculated_price < min_service_threshold",
+      "level": "high",
+      "message": "Расчётная цена ниже минимального чека (Обучение: 10к, СОУТ: 20к, ПЛК/ОПР: 15к)"
     },
     {
       "id": "cost_near_nmck",
       "name": "Себестоимость близка к НМЦК",
       "condition": "cost_price / nmck > 0.85",
       "level": "high",
-      "message": "Себестоимость > 85% от НМЦК — нет пространства для маржи"
+      "message": "Себестоимость > 85% от НМЦК — нет пространства для демпинга/маржи"
     },
     {
       "id": "nmck_below_cost",
@@ -100,18 +172,40 @@
       "name": "Сверхсжатые сроки",
       "condition": "deadline_days < 5",
       "level": "high",
-      "message": "Срок исполнения < 5 дней — критический риск"
+      "message": "Срок исполнения < 5 дней — увеличить накладные расходы или отклонить"
+    },
+    {
+      "id": "rigged_tender_signs",
+      "name": "Признаки договорного тендера",
+      "condition": "has_rigged_signs == true",
+      "level": "high",
+      "message": "Выявлены признаки заточенного/договорного тендера"
     },
     {
       "id": "complex_logistics",
       "name": "Сложная логистика",
       "condition": "addresses_count > 3",
       "level": "medium",
-      "message": "Несколько адресов в разных городах — высокие транспортные расходы"
+      "message": "Несколько адресов в разных городах — требуются индивидуальные логистические расчёты"
+    },
+    {
+      "id": "high_subcontract_share",
+      "name": "Высокая доля субподряда",
+      "condition": "subcontract_share > 0.40",
+      "level": "medium",
+      "message": "Доля субподряда превышает 40% от себестоимости"
+    },
+    {
+      "id": "long_payment_deferral",
+      "name": "Длительная отсрочка платежа",
+      "condition": "payment_days > 30",
+      "level": "medium",
+      "message": "Отсрочка оплаты более 30 рабочих дней"
     }
   ],
   "decision_logic": {
-    "recommended": "margin_percent >= 10 AND no_forbidden_directions AND risk_level != high",
-    "reject": "has_forbidden_directions OR margin_percent < 10 OR risk_level == high"
+    "recommended": "nmck >= 100000 AND calculated_price >= min_service_threshold AND ((category != 'goods' AND margin_percent >= 15) OR (category == 'goods' AND nmck <= 300000 AND margin_percent >= 5)) AND no_forbidden_directions AND risk_level == low",
+    "conditional": "nmck >= 100000 AND calculated_price >= min_service_threshold AND margin_percent >= 10 AND margin_percent < 15 AND no_forbidden_directions AND risk_level != high",
+    "reject": "nmck < 100000 OR calculated_price < min_service_threshold OR has_forbidden_directions OR (category == 'goods' AND (nmck > 300000 OR margin_percent < 5)) OR (category != 'goods' AND margin_percent < 10) OR risk_level == high"
   }
 }

@@ -2,11 +2,9 @@
 core/analysis/analyzer.py
 Фасад для анализа тендеров.
 
-v7.7.0:
-  - Принудительная верификация данных через АГЕНТА + MCP для ВСЕХ тендеров
-  - Передача reg_number в LLM для корректной работы инструментов search_documents
-  - Сквозное логирование расхождений между парсером и агентом
-  - Интеграция с agent_thinking логгером
+v8.1.0-Separated Services:
+  - Четкое разделение: TenderClassifierService (старый YandexGPT) для типа тендера,
+    AgentService (AI Studio Agent) для анализа ТЗ.
 """
 
 import json
@@ -23,21 +21,19 @@ from core.analysis.result import AnalysisResult
 from core.analysis.guard_engine import GuardEngine
 from core.calculation.calculator_router import CalculatorRouter
 
-# v7.0.0: Единые сервисы вместо дублей
 from core.services.type_service import TypeService
-from core.services.llm_service import LlmService
+from core.services.tender_classifier import TenderClassifierService
+from core.services.agent_service import AgentService
 from core.services.fallback_service import FallbackService
 
-# Логгер для мышления агента
 agent_logger = logger.bind(type="agent_thinking")
 
 
 class TenderAnalyzer:
-    """Фасад для анализа тендеров. v7.7.0: обязательная верификация MCP + логирование."""
+    """Фасад для анализа тендеров v8.1.0"""
 
-    VERSION = "v7.7.0"
+    VERSION = "v8.1.0-Separated"
 
-    # Mapping ЭТП → комиссия (%)
     ETP_COMMISSION_RATES = {
         "ртс-тендер": 1.0,
         "ртс": 1.0,
@@ -50,21 +46,78 @@ class TenderAnalyzer:
         "агора": 0.8,
     }
 
+    PROFITABLE_TYPES = {"sout", "opr", "sout_opr", "plk", "education"}
+
     def __init__(
         self,
         calculator: TenderCalculator,
         risk_analyzer: RiskAnalyzer,
-        type_detector: TenderTypeDetector,
+        type_detector: Optional[TenderTypeDetector] = None,
         llm_client: Optional[YandexGPTClient] = None,
+        agent_client: Any = None,
     ):
         self.calculator = calculator
         self.risk_analyzer = risk_analyzer
+
+        # 1. Сервис определения типа тендера (Легкий YandexGPT)
+        self.classifier_service = TenderClassifierService(llm_client=llm_client)
+
+        # 2. Сервис анализа самого тендера (AI Studio Agent)
+        self.agent_service = AgentService(agent_client=agent_client)
+
         self.type_service = TypeService()
-        self.llm_service = LlmService(llm_client or YandexGPTClient())
         self.fallback_service = FallbackService()
         self.guard_engine = GuardEngine()
         self.calculator_router = CalculatorRouter(calculator)
         logger.info(f"TenderAnalyzer инициализирован ({self.VERSION})")
+
+    def _determine_tender_type_pipeline(
+        self,
+        tender_info: Dict[str, Any],
+        documents_text: str = "",
+        llm_classification: Optional[str] = None,
+        llm_confidence: float = 0.0,
+        tender_type_hint: Optional[str] = None,
+    ) -> tuple[str, str, str]:
+
+        # --- 1. КТРУ Override ---
+        if tender_info.get("students_count", 0) > 0:
+            logger.info(
+                f"[{self.VERSION}] [Pipeline] Override типа: 'education' "
+                f"(КТРУ дал {tender_info['students_count']} слушателей)"
+            )
+            agent_logger.info("🔄 OVERRIDE ТИПА: education (по данным КТРУ)")
+            return "education", "ktru_override", "ktru"
+
+        # --- 2. Стандартный TypeService (Regex / Parser hint) ---
+        tender_type, type_source, method = self.type_service.resolve(
+            tender_info=tender_info,
+            documents_text=documents_text,
+            llm_classification=llm_classification,
+            llm_confidence=llm_confidence,
+            tender_type_hint=tender_type_hint,
+        )
+
+        if tender_type in self.PROFITABLE_TYPES:
+            return tender_type, type_source, method
+
+        # --- 3. YandexGPT Classifier по Title (Вызываем ClassifierService!) ---
+        title = tender_info.get("title") or tender_info.get("object_info") or ""
+        if title:
+            logger.info(
+                f"[{self.VERSION}] [Pipeline] TypeService вернул '{tender_type}'. "
+                f"Запуск легкого YandexGPT классификатора по title..."
+            )
+
+            # Вызываем классификатор:
+            gpt_type = self.classifier_service.classify_tender_type(title)
+
+            logger.info(f"[{self.VERSION}] [Pipeline] YandexGPT вердикт: '{gpt_type}'")
+
+            if gpt_type in self.PROFITABLE_TYPES:
+                return gpt_type, "yandexgpt_title_classifier", "llm_fast_title"
+
+        return tender_type, type_source, method
 
     def analyze(
         self,
@@ -74,27 +127,12 @@ class TenderAnalyzer:
         llm_confidence: float = 0.0,
         tender_type_hint: Optional[str] = None,
     ) -> AnalysisResult:
-        """Анализирует тендер полностью."""
-        logger.info(f"[{self.VERSION}] Начинаю анализ тендера")
-        agent_logger.info(
-            f"🔍 НАЧАЛО АНАЛИЗА ТЕНДЕРА: {tender_info.get('reg_number', 'UNKNOWN')}"
-        )
+        tender_id = tender_info.get("reg_number", "UNKNOWN")
+        logger.info(f"[{self.VERSION}] Начинаю анализ тендера {tender_id}")
+        agent_logger.info(f"🔍 НАЧАЛО АНАЛИЗА ТЕНДЕРА: {tender_id}")
 
-        # === P0-3: ПРИОРИТЕТ КТРУ НАД HINT'ОМ ПАРСЕРА ===
-        if tender_info.get("students_count", 0) > 0:
-            if tender_type_hint and tender_type_hint != "education":
-                logger.warning(
-                    f"[{self.VERSION}] Override типа: {tender_type_hint} → education "
-                    f"(КТРУ дал {tender_info['students_count']} слушателей)"
-                )
-                tender_type_hint = "education"
-                agent_logger.info(
-                    f"🔄 OVERRIDE ТИПА: {tender_type_hint} → education (КТРУ)"
-                )
-        # ==========================================
-
-        # Шаг 1: Определение типа (через TypeService)
-        tender_type, type_source, method = self.type_service.resolve(
+        # Шаг 1: Определение типа тендера
+        tender_type, type_source, method = self._determine_tender_type_pipeline(
             tender_info=tender_info,
             documents_text=documents_text,
             llm_classification=llm_classification,
@@ -107,79 +145,74 @@ class TenderAnalyzer:
         tender_info, guards = self.guard_engine.apply(tender_info, tender_type)
         if guards:
             agent_logger.info(f"🛡️ СРАБОТАЛИ GUARD'Ы: {guards}")
-        # Шаг 3: ПРИНУДИТЕЛЬНАЯ ВЕРИФИКАЦИЯ ЧЕРЕЗ АГЕНТА + MCP
-        self._verify_with_agent(tender_info, documents_text, tender_type)
 
-        # === КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Жесткая блокировка fallback ===
+        # === Вызов AI Studio Agent ===
+        if tender_type not in self.PROFITABLE_TYPES:
+            logger.info(
+                f"[{self.VERSION}] ⚡ Пропуск AI Studio Agent для непрофильного типа '{tender_type}'."
+            )
+            agent_logger.info(
+                f"⏩ СКИП АГЕНТА: Тип '{tender_type}' не относится к целевым закупкам."
+            )
+            tender_info["agent_blocked"] = True
+            tender_info["agent_block_reason"] = (
+                f"Непрофильный тип тендера: {tender_type}"
+            )
+        else:
+            # Вызываем Агента
+            self._verify_with_agent(tender_info, documents_text, tender_type)
+
+        # === БЛОКИРОВКА И FALLBACK ===
         if tender_info.get("agent_blocked"):
-            tender_id = tender_info.get(
-                "reg_number", "UNKNOWN_ID"
-            )  # <-- ДОБАВИТЬ ЭТУ СТРОКУ
             reason = tender_info.get("agent_block_reason", "Неизвестная причина")
-
             logger.warning(
-                f"[{self.VERSION}] 🚫 АГЕНТ ЗАБЛОКИРОВАЛ ТЕНДЕР {tender_id}. Fallback ОТМЕНЕН."
+                f"[{self.VERSION}] 🚫 АГЕНТ/ФИЛЬТР ЗАБЛОКИРОВАЛ ТЕНДЕР {tender_id}. Fallback ОТМЕНЕН."
             )
             agent_logger.error(f"❌ Fallback отменен для {tender_id}: {reason}")
         else:
-            # Шаг 3.5: Fallback-оценки по НМЦК (через FallbackService)
             logger.info(f"[{self.VERSION}] Запуск fallback-оценок...")
             self.fallback_service.apply(tender_info, tender_type)
-        # ==========================================
-        # ==========================================
-        # ==========================================
-        # Шаг 3.5: Fallback-оценки по НМЦК (через FallbackService)
-        self.fallback_service.apply(tender_info, tender_type)
 
-        # === P1-4: СОХРАНЕНИЕ FALLBACK В TENDER_INFO ДЛЯ DETAILS ===
-        nmck = tender_info.get("nmck", 0)
-        if nmck > 0:
-            if tender_type == "sout" and not tender_info.get("rm_total"):
-                estimated = int(nmck / 1200)
-                tender_info["rm_total"] = estimated
-                tender_info["rm_total_source"] = "fallback_nmck"
-                logger.info(
-                    f"[{self.VERSION}] Fallback СОУТ: {estimated} РМ → сохранено в tender_info"
-                )
-                agent_logger.info(f"📉 FALLBACK СОУТ: {estimated} РМ (из НМЦК)")
-            elif (
-                tender_type == "plk"
-                and not tender_info.get("measurement_points")
-                and not tender_info.get("points_count")
-            ):
-                estimated = int(nmck / 500)
-                tender_info["measurement_points"] = estimated
-                tender_info["points_count"] = estimated
-                tender_info["points_source"] = "fallback_nmck"
-                logger.info(
-                    f"[{self.VERSION}] Fallback ПЛК: {estimated} точек → сохранено в tender_info"
-                )
-                agent_logger.info(f" FALLBACK ПЛК: {estimated} точек (из НМЦК)")
-            elif (
-                tender_type == "opr"
-                and not tender_info.get("opr_positions")
-                and not tender_info.get("opr_persons")
-            ):
-                estimated = int(nmck / 700)
-                tender_info["opr_positions"] = estimated
-                tender_info["opr_positions_source"] = "fallback_nmck"
-                logger.info(
-                    f"[{self.VERSION}] Fallback ОПР: {estimated} позиций → сохранено в tender_info"
-                )
-                agent_logger.info(f"📉 FALLBACK ОПР: {estimated} позиций (из НМЦК)")
-            elif tender_type == "education" and not tender_info.get("students_count"):
-                estimated = int(nmck / 1500)
-                tender_info["students_count"] = estimated
-                tender_info["students_count_source"] = "fallback_nmck"
-                logger.info(
-                    f"[{self.VERSION}] Fallback Обучение: {estimated} слушателей → сохранено в tender_info"
-                )
-                agent_logger.info(
-                    f" FALLBACK ОБУЧЕНИЕ: {estimated} слушателей (из НМЦК)"
-                )
-        # ==========================================
+            nmck = tender_info.get("nmck", 0)
+            if nmck > 0:
+                if tender_type in ("sout", "sout_opr") and not tender_info.get(
+                    "rm_total"
+                ):
+                    estimated = int(nmck / 1200)
+                    tender_info["rm_total"] = estimated
+                    tender_info["rm_total_source"] = "fallback_nmck"
+                    agent_logger.info(f"📉 FALLBACK СОУТ: {estimated} РМ (из НМЦК)")
+                elif (
+                    tender_type == "plk"
+                    and not tender_info.get("measurement_points")
+                    and not tender_info.get("points_count")
+                ):
+                    estimated = int(nmck / 500)
+                    tender_info["measurement_points"] = estimated
+                    tender_info["points_count"] = estimated
+                    tender_info["points_source"] = "fallback_nmck"
+                    agent_logger.info(f"📉 FALLBACK ПЛК: {estimated} точек (из НМЦК)")
+                elif (
+                    tender_type == "opr"
+                    and not tender_info.get("opr_positions")
+                    and not tender_info.get("opr_persons")
+                ):
+                    estimated = int(nmck / 700)
+                    tender_info["opr_positions"] = estimated
+                    tender_info["opr_positions_source"] = "fallback_nmck"
+                    agent_logger.info(f"📉 FALLBACK ОПР: {estimated} позиций (из НМЦК)")
+                elif tender_type == "education" and not tender_info.get(
+                    "students_count"
+                ):
+                    estimated = int(nmck / 1500)
+                    tender_info["students_count"] = estimated
+                    tender_info["students_count_source"] = "fallback_nmck"
+                    agent_logger.info(
+                        f"📉 FALLBACK ОБУЧЕНИЕ: {estimated} слушателей (из НМЦК)"
+                    )
 
         # Шаг 4: Глобальные затраты
+        nmck = tender_info.get("nmck", 0)
         deadline_days = tender_info.get("deadline_days", 30)
         etp_commission = self._resolve_etp_commission(tender_info)
         app_guarantee = self._parse_guarantee_percent(
@@ -247,9 +280,6 @@ class TenderAnalyzer:
             isinstance(deadline_days, (int, float)) and deadline_days <= 0
         ):
             deadline_days = 30
-            logger.info(
-                f"[{self.VERSION}] deadline_days не указан, используем дефолт 30"
-            )
 
         risk_result = self.risk_analyzer.analyze(
             tender_type=tender_type,
@@ -270,12 +300,8 @@ class TenderAnalyzer:
                 "max_cost_to_nmck_ratio", 0.85
             )
             risk_result["flags"] = risk_result.get("flags", []) + [
-                f"Себестоимость составляет >{max_ratio*100:.0f}% от НМЦК "
-                f"— высокий риск убыточности"
+                f"Себестоимость составляет >{max_ratio*100:.0f}% от НМЦК — высокий риск убыточности"
             ]
-            agent_logger.warning(
-                f"🔴 ПОВЫШЕННЫЙ РИСК: cost/NMCK > {max_ratio*100:.0f}%"
-            )
 
         # Шаг 8: Комментарий
         comment = self._build_comment(
@@ -311,16 +337,17 @@ class TenderAnalyzer:
             red_flags=risk_result.get("flags", []),
         )
 
-    # ==================== ВЕРИФИКАЦИЯ ЧЕРЕЗ АГЕНТА (v7.7.0) ====================
+    # ==================== ВЕРИФИКАЦИЯ ЧЕРЕЗ АГЕНТА ====================
 
     def _verify_with_agent(
         self, tender_info: Dict[str, Any], documents_text: str, tender_type: str
     ) -> None:
         """
-        v7.7.0: Принудительная верификация данных через АГЕНТА + MCP.
-        Вызывается для КАЖДОГО тендера. Передает reg_number для работы инструментов.
+        Верификация запускается ТОЛЬКО для подтвержденных целевых тендеров.
+        Использует AgentService (AI Studio Agent).
         """
         tender_id = tender_info.get("reg_number", "UNKNOWN_ID")
+        truncated_text = documents_text[:25000] if documents_text else ""
 
         parser_context = {
             "tender_id": tender_id,
@@ -334,39 +361,35 @@ class TenderAnalyzer:
         }
 
         logger.info(
-            f"[{self.VERSION}] Запуск агента для ВЕРИФИКАЦИИ тендера {tender_id}..."
+            f"[{self.VERSION}] 🚀 Запуск AI Studio Agent для профильного тендера {tender_id} (тип: {tender_type})..."
         )
-        agent_logger.info(f" ЗАПУСК ВЕРИФИКАЦИИ АГЕНТОМ: {tender_id}")
+        agent_logger.info(f"🤖 ЗАПУСК ВЕРИФИКАЦИИ АГЕНТОМ: {tender_id}")
 
-        extracted = self.llm_service.extract_params(
+        # Вызываем метод из AgentService:
+        extracted = self.agent_service.extract_params(
             tender_type=tender_type,
-            documents_text=documents_text,
+            documents_text=truncated_text,
             tender_id=tender_id,
             context_override=json.dumps(parser_context, ensure_ascii=False),
         )
 
-        # === НОВОЕ: Обработка осознанного отказа агента ===
         if extracted and extracted.get("blocked_by_error"):
             reason = extracted.get("reason", "Ошибка анализа")
             logger.warning(
                 f"[{self.VERSION}] Агент отказался анализировать {tender_id}: {reason}"
             )
             agent_logger.warning(f"🚫 ОТКАЗ АГЕНТА: {reason}")
-
-            # Помечаем тендер как проблемный, чтобы не применять fallback
             tender_info["agent_blocked"] = True
             tender_info["agent_block_reason"] = reason
             return
-        # ==========================================
 
         if not extracted:
             logger.warning(
                 f"[{self.VERSION}] Агент не вернул верифицированные данные для {tender_id}"
             )
-            agent_logger.warning(f" АГЕНТ НЕ ВЕРНУЛ ДАННЫЕ ДЛЯ {tender_id}")
+            agent_logger.warning(f"⚠️ АГЕНТ НЕ ВЕРНУЛ ДАННЫЕ ДЛЯ {tender_id}")
             return
 
-        # Логирование сравнения данных
         agent_logger.info(f"🔄 СРАВНЕНИЕ ДАННЫХ ПАРСЕРА И АГЕНТА ДЛЯ {tender_id}:")
 
         for key, value in extracted.items():
@@ -376,8 +399,7 @@ class TenderAnalyzer:
 
                 if old_val != value and old_val is not None:
                     logger.warning(
-                        f"[{self.VERSION}] ️ РАСХОЖДЕНИЕ в {tender_id}: {key} изменено с {old_val} на {value} "
-                        f"(по результатам проверки агентом/MCP)"
+                        f"[{self.VERSION}] ⚠️ РАСХОЖДЕНИЕ в {tender_id}: {key} изменено с {old_val} на {value}"
                     )
                     agent_logger.warning(f"⚠️ РАСХОЖДЕНИЕ: {key} {old_val} → {value}")
                 else:
@@ -386,7 +408,7 @@ class TenderAnalyzer:
                     )
                     agent_logger.info(f"✅ ПОДТВЕРЖДЕНО: {key}={value}")
 
-    # ==================== Утилиты для guard'ов ====================
+    # ==================== Утилиты ====================
 
     def _merge_review_reasons(
         self, existing: str, limits_reason: str, violations: List[str]
@@ -408,10 +430,6 @@ class TenderAnalyzer:
         platform = tender_info.get("platform_name", "").lower()
         for key, val in self.ETP_COMMISSION_RATES.items():
             if key in platform:
-                logger.info(
-                    f"[{self.VERSION}] ЭТП определена по площадке "
-                    f"'{platform}': {val}%"
-                )
                 return val
         return 0.0
 
@@ -432,10 +450,6 @@ class TenderAnalyzer:
         total_extra = extra_costs.get("total_extra", 0)
 
         if base_result.cost_price <= 0:
-            logger.warning(
-                f"[{self.VERSION}] Базовая себестоимость = 0, "
-                f"global_costs не применяются. Причина: {base_result.review_reason}"
-            )
             return base_result
 
         new_cost = base_result.cost_price + total_extra
@@ -546,6 +560,6 @@ class TenderAnalyzer:
 
         if result.review_reason:
             lines.append("")
-            lines.append(f"️ {result.review_reason}")
+            lines.append(f"⚠️ {result.review_reason}")
 
         return "\n".join(lines)

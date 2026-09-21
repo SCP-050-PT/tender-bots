@@ -14,8 +14,8 @@ core/risk_rules.py
 - FIX: добавлен guard на base_cost_price=0 (не удалось рассчитать)
 """
 
-from typing import Dict, Any, Optional
-from dataclasses import dataclass
+from typing import Dict, Any, Optional, List
+from dataclasses import dataclass, asdict
 from loguru import logger
 
 
@@ -25,25 +25,30 @@ class RiskResult:
 
     risk_level: str  # low, medium, high
     decision: str  # рекомендуется, не рекомендуется, осторожно
-    flags: list  # список флагов рисков
+    flags: List[str]
     needs_manual_review: bool
     review_reason: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
 
 
 class RiskAnalyzer:
     """Анализатор рисков тендеров."""
 
-    VERSION = "v6.9.2"
+    VERSION = "v6.9.3"
 
-    def __init__(self, config: Optional[Dict] = None):
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
         self.config = config or {}
         self.thresholds = {
             "min_margin_percent": 5.0,
             "max_margin_percent": 200.0,
             "min_deadline_days": 3,
-            "max_nmck_ratio": 1.5,  # рекомендуемая цена не более 150% НМЦК
-            "opr_cost_threshold": 50000.0,  # v6.8: порог для ОПР
+            "max_cost_to_nmck_ratio": 0.90,  # Себестоимость не более 90% НМЦК
+            "opr_cost_threshold": 50000.0,
         }
+        # Переопределение порогов из config при наличии
+        self.thresholds.update(self.config.get("thresholds", {}))
         logger.info(f"RiskAnalyzer инициализирован ({self.VERSION})")
 
     def analyze(
@@ -55,88 +60,80 @@ class RiskAnalyzer:
         deadline_days: int = 30,
         region: str = "",
         needs_manual_review: bool = False,
-        limit_applied: bool = False,  # v6.9.2: цена поднята лимитом
-        cost_to_nmck_ratio: float = 0.0,  # v6.9.2: из apply_global_limits
+        limit_applied: bool = False,
+        cost_to_nmck_ratio: float = 0.0,
     ) -> Dict[str, Any]:
-        """Анализирует риски тендера."""
-        flags = []
+        """Анализирует риски тендера и возвращает словарь с результатами."""
+        flags: List[str] = []
         risk_level = "low"
-        decision = "рекомендуется"
 
-        # v6.9.2: Guard - base_cost_price = 0 (не удалось рассчитать)
+        # 1. Guard - base_cost_price = 0
         if cost_price <= 0:
             flags.append("Себестоимость = 0 — не удалось рассчитать стоимость")
-            risk_level = "high"
-            decision = "не рекомендуется"
             logger.error(f"[{self.VERSION}] GUARD: cost_price = 0")
-            return {
-                "risk_level": risk_level,
-                "decision": decision,
-                "flags": flags,
-                "needs_manual_review": True,
-            }
+            return RiskResult(
+                risk_level="high",
+                decision="не рекомендуется",
+                flags=flags,
+                needs_manual_review=True,
+                review_reason="Себестоимость не рассчитана",
+            ).to_dict()
 
-        # v6.9.2: Guard - cost/НМЦК превышен (перенесено из risk_rules в global_limits)
-        # Но если global_limits не сработал, ловим здесь
-        if cost_to_nmck_ratio > 0.90:
+        # 2. Guard - cost/НМЦК превышен
+        max_cost_ratio = self.thresholds["max_cost_to_nmck_ratio"]
+        if cost_to_nmck_ratio > max_cost_ratio:
             flags.append(
                 f"Себестоимость ({cost_price:,.0f}₽) составляет {cost_to_nmck_ratio*100:.0f}% от НМЦК ({nmck:,.0f}₽)"
             )
             risk_level = "high"
-            decision = "не рекомендуется"
             logger.error(
                 f"[{self.VERSION}] GUARD: cost/НМЦК = {cost_to_nmck_ratio*100:.1f}%"
             )
 
-        # v6.8: Guard - цена не должна превышать НМЦК
+        # 3. Guard - цена не должна превышать НМЦК
         recommended_price = cost_price * (1 + margin_percent / 100)
         if recommended_price > nmck:
             flags.append(
                 f"Рекомендуемая цена ({recommended_price:,.0f}₽) превышает НМЦК ({nmck:,.0f}₽)"
             )
             risk_level = "high"
-            decision = "не рекомендуется"
             logger.error(f"[{self.VERSION}] GUARD: цена > НМЦК")
 
-        # v6.9.2 FIX: Guard - маржа > 200%, НО не срабатывает если limit_applied
-        # (т.к. цена была искусственно поднята min_contract_sum)
+        # 4. Guard - аномально высокая маржа (>200%)
         if margin_percent > self.thresholds["max_margin_percent"]:
             if limit_applied:
                 logger.info(
                     f"[{self.VERSION}] Маржа {margin_percent:.1f}% высокая, "
-                    f"но цена поднята лимитом (limit_applied=True) — НЕ считаем аномалией"
+                    f"но цена поднята лимитом (limit_applied=True) — не аномалия"
                 )
             elif (
                 tender_type == "opr"
                 and cost_price < self.thresholds["opr_cost_threshold"]
             ):
                 logger.info(
-                    f"[{self.VERSION}] ОПР с себестоимостью {cost_price:,.0f}₽ - "
-                    f"маржа {margin_percent:.1f}% не считаем аномалией"
+                    f"[{self.VERSION}] ОПР с себестоимостью {cost_price:,.0f}₽ — "
+                    f"маржа {margin_percent:.1f}% не аномалия"
                 )
             else:
                 flags.append(f"Аномально высокая маржа: {margin_percent:.1f}%")
                 risk_level = "high"
-                decision = "не рекомендуется"
                 logger.error(
                     f"[{self.VERSION}] GUARD: маржа {margin_percent:.1f}% > {self.thresholds['max_margin_percent']}%"
                 )
 
-        # v6.8: Guard - маржа < 5% (убыточно)
+        # 5. Средние риски (не перекрывают high)
         if margin_percent < self.thresholds["min_margin_percent"]:
             flags.append(f"Низкая маржа: {margin_percent:.1f}%")
             if risk_level == "low":
                 risk_level = "medium"
             logger.warning(f"[{self.VERSION}] Низкая маржа: {margin_percent:.1f}%")
 
-        # Guard - короткий дедлайн
         if deadline_days < self.thresholds["min_deadline_days"]:
             flags.append(f"Короткий срок: {deadline_days} дней")
             if risk_level == "low":
                 risk_level = "medium"
             logger.warning(f"[{self.VERSION}] Короткий срок: {deadline_days} дней")
 
-        # v6.8: Guard - needs_manual_review поднимает риск
         if needs_manual_review:
             flags.append("Требуется ручная проверка")
             if risk_level == "low":
@@ -145,9 +142,17 @@ class RiskAnalyzer:
                 f"[{self.VERSION}] needs_manual_review -> риск повышен до {risk_level}"
             )
 
-        return {
-            "risk_level": risk_level,
-            "decision": decision,
-            "flags": flags,
-            "needs_manual_review": needs_manual_review or len(flags) > 0,
+        # Динамическое определение итогового решения по уровню риска
+        decision_map = {
+            "high": "не рекомендуется",
+            "medium": "осторожно",
+            "low": "рекомендуется",
         }
+        decision = decision_map.get(risk_level, "осторожно")
+
+        return RiskResult(
+            risk_level=risk_level,
+            decision=decision,
+            flags=flags,
+            needs_manual_review=needs_manual_review or len(flags) > 0,
+        ).to_dict()

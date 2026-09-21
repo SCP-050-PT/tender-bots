@@ -2,15 +2,14 @@
 core/calculation/calculator_router.py
 Маршрутизация расчётов по типам тендеров.
 
-v7.5.0:
-  - Добавлена поддержка ПЛК в комбинированных тендерах (P0-2)
-  - Улучшена логика определения subtypes для combined
-  - Fallback для ОПР (оценка по НМЦК)
-  - Проверка аккредитации для ПЛК
-  - Защита от ложного ОПР (ЭТЛ, пожарка)
+v8.0.0-Optimized:
+  - Безопасный перехват исключений при расчете.
+  - Агрегация транспортных, субподрядных расходов и гарантий в combined-расчете.
+  - Унификация флагов agent_blocked / blocked_by_agent.
+  - Оптимизация чтения конфигурации аккредитации.
 """
 
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from loguru import logger
 import json
 from pathlib import Path
@@ -20,89 +19,96 @@ from core.calculation.calculation_result import CalculationResult
 
 
 class CalculatorRouter:
-    VERSION = "v7.5.0"
+    VERSION = "v8.0.0-Optimized"
+    _accreditation_cache: Optional[Dict] = None
 
     def __init__(self, calculator: TenderCalculator):
         self.calculator = calculator
-        self.accreditation = self._load_accreditation()
+        self.accreditation = self._get_accreditation()
 
-    def _load_accreditation(self) -> Dict:
-        try:
-            path = (
-                Path(__file__).resolve().parent.parent.parent
-                / "knowledge"
-                / "area_accreditation.json"
-            )
-            if path.exists():
-                with open(path, "r", encoding="utf-8") as f:
-                    return json.load(f)
-        except Exception as e:
-            logger.warning(f"[{self.VERSION}] Не удалось загрузить аккредитацию: {e}")
-        return {}
+    @classmethod
+    def _get_accreditation(cls) -> Dict:
+        """Ленивая загрузка и кэширование справочника аккредитации."""
+        if cls._accreditation_cache is None:
+            try:
+                path = (
+                    Path(__file__).resolve().parent.parent.parent
+                    / "knowledge"
+                    / "area_accreditation.json"
+                )
+                if path.exists():
+                    with open(path, "r", encoding="utf-8") as f:
+                        cls._accreditation_cache = json.load(f)
+                else:
+                    cls._accreditation_cache = {}
+            except Exception as e:
+                logger.warning(
+                    f"[{cls.VERSION}] Не удалось загрузить аккредитацию: {e}"
+                )
+                cls._accreditation_cache = {}
+        return cls._accreditation_cache
 
     def calculate(
         self, tender_info: Dict[str, Any], tender_type: str, documents_text: str
     ) -> CalculationResult:
 
-        # === v7.4.0: Проверка на блокировку от Агента ===
-        if tender_info.get("blocked_by_agent"):
-            logger.warning(
-                f"[{self.VERSION}] Тендер заблокирован агентом: {tender_info.get('reason')}"
+        # === Проверка на блокировку от Агента ===
+        is_blocked = tender_info.get("blocked_by_agent") or tender_info.get(
+            "agent_blocked"
+        )
+        if is_blocked:
+            reason = (
+                tender_info.get("agent_block_reason")
+                or tender_info.get("reason")
+                or "Заблокировано агентом"
             )
-            return self._manual_review(
-                tender_info.get("reason", "Заблокировано агентом")
+            logger.warning(f"[{self.VERSION}] Тендер заблокирован агентом: {reason}")
+            return self._manual_review(reason)
+
+        try:
+            # 1. Запуск нужного калькулятора
+            if tender_type == "sout":
+                result = self._calc_sout(tender_info)
+            elif tender_type == "education":
+                result = self._calc_education(tender_info, documents_text)
+            elif tender_type == "opr":
+                result = self._calc_opr(tender_info, documents_text)
+            elif tender_type in ("plk", "testing"):
+                result = self._calc_plk(tender_info, documents_text)
+            elif tender_type == "combined":
+                result = self._calc_combined(tender_info, documents_text)
+            else:
+                return self._manual_review(f"Неизвестный тип тендера: {tender_type}")
+
+        except Exception as e:
+            logger.error(
+                f"[{self.VERSION}] Ошибка вычислений для {tender_type}: {e}",
+                exc_info=True,
             )
-        # ==========================================
+            return self._manual_review(f"Ошибка при расчете себестоимости: {e}")
 
-        # 1. Сначала получаем результат расчета в переменную result
-        if tender_type == "sout":
-            result = self._calc_sout(tender_info)
-        elif tender_type == "education":
-            result = self._calc_education(tender_info, documents_text)
-        elif tender_type == "opr":
-            result = self._calc_opr(tender_info, documents_text)
-        elif tender_type in ("plk", "testing"):
-            result = self._calc_plk(tender_info, documents_text)
-        elif tender_type == "combined":
-            result = self._calc_combined(tender_info, documents_text)
-        else:
-            return self._manual_review("Неизвестный тип тендера")
+        # 2. SANITY CHECK: Проверка адекватности цены
+        nmck = float(tender_info.get("nmck", 0) or 0)
 
-        # 2. Теперь применяем SANITY CHECK к полученному результату
-        # === SANITY CHECK: Проверка адекватности цены ===
-        nmck = tender_info.get("nmck", 0)
-        
-        # Проверяем, что результат вообще существует и это не ручная проверка без цены
         if result and nmck > 0 and result.recommended_price > 0:
             ratio = result.recommended_price / nmck
-            
-            # Если наша цена меньше 20% от НМЦК или больше 150% — это подозрительно
+
             if ratio < 0.2 or ratio > 1.5:
                 logger.warning(
                     f"[{self.VERSION}] SANITY CHECK FAIL: Цена {result.recommended_price:.0f} "
                     f"при НМЦК {nmck:.0f} (Ratio: {ratio:.2f})"
                 )
                 result.needs_manual_review = True
-                # Добавляем причину к существующим, если они есть
                 reason_prefix = f"Аномальное соотношение цены к НМЦК ({ratio:.0%}). "
                 if result.review_reason:
                     result.review_reason = f"{reason_prefix} | {result.review_reason}"
                 else:
                     result.review_reason = f"{reason_prefix}Требуется ручная проверка."
-        # ==============================================
 
-        # 3. Возвращаем проверенный результат
         return result
 
-    # ==================== СОУТ (v7.6.0: Единая формула) ====================
+    # ==================== СОУТ ====================
     def _calc_sout(self, info: Dict[str, Any]) -> CalculationResult:
-        # === Проверка на осознанную ошибку/блокировку от Агента ===
-        if info.get("agent_blocked"):
-            reason = info.get("agent_block_reason", "Заблокировано агентом")
-            logger.warning(f"[{self.VERSION}] Тендер заблокирован агентом (нет файлов): {reason}")
-            return self._manual_review(reason)
-        # ==========================================
-
         rm_total = info.get("rm_total", 0)
 
         if not rm_total:
@@ -121,9 +127,8 @@ class CalculatorRouter:
         cities_count = info.get("cities_count", 1)
         regions_count = info.get("regions_count", 1)
 
-        # ИСПРАВЛЕНИЕ: Удаляем variant, так как старый калькулятор его не знает
         safe_info = dict(info)
-        safe_info.pop("variant", None) 
+        safe_info.pop("variant", None)
 
         return self.calculator.calculate_sout(
             rm_total=rm_total,
@@ -190,7 +195,6 @@ class CalculatorRouter:
             }
 
         if "переподготовка" in text_lower or "повышение квалификации" in text_lower:
-            # v7.3.0: Проверка на удостоверение для пожарки
             if "пожарн" in text_lower and (
                 "удостоверение" in text_lower or "удостоверения" in text_lower
             ):
@@ -212,7 +216,6 @@ class CalculatorRouter:
         persons = info.get("opr_persons", 0)
         nmck = info.get("nmck", 0)
 
-        # v7.2.9/v7.3.0: Защита от ложного ОПР
         if documents_text:
             text_lower = documents_text.lower()
             forbidden_kw = [
@@ -231,7 +234,6 @@ class CalculatorRouter:
                     "Обнаружены признаки ЭТЛ/Пожарки/Диагностики. Не ОПР."
                 )
 
-        # v7.3.0: Fallback для количества РМ
         if positions == 0 and persons == 0:
             if nmck > 0:
                 estimated_rm = int(nmck / 700)
@@ -258,8 +260,8 @@ class CalculatorRouter:
             needs_iot_norms=info.get("needs_iot_norms", False),
             transport_cost=info.get("transport_cost", 0),
             trip_days=info.get("trip_days", 0),
-            cities_count=info.get("cities_count", 1),  
-            addresses_count=info.get("addresses_count", 1),  
+            cities_count=info.get("cities_count", 1),
+            addresses_count=info.get("addresses_count", 1),
         )
 
     # ==================== ПЛК ====================
@@ -267,22 +269,16 @@ class CalculatorRouter:
         self, info: Dict[str, Any], documents_text: str = ""
     ) -> CalculationResult:
         points = info.get("measurement_points", 0) or info.get("points_count", 0)
-        measurement_types = info.get(
-            "measurement_types", []
-        )  # <-- НОВОЕ: список факторов от агента
+        measurement_types = info.get("measurement_types", [])
 
         needs_subcontractor = info.get("needs_subcontractor", False)
 
-        # v7.4.0: Усиленная проверка аккредитации по списку факторов от агента
         if measurement_types and self.accreditation:
-            can_measure = set(self.accreditation.get("can_measure", []))
             cannot_measure = set(self.accreditation.get("cannot_measure", []))
-
             forbidden_found = []
 
             for factor in measurement_types:
                 f_lower = factor.lower()
-                # Проверяем запрещенные
                 if any(
                     cm.lower() in f_lower or f_lower in cm.lower()
                     for cm in cannot_measure
@@ -297,7 +293,6 @@ class CalculatorRouter:
                 info["review_reason"] = reason
 
         if not points:
-            # Fallback для ПЛК
             nmck = info.get("nmck", 0)
             if nmck > 0:
                 points = int(nmck / 500)
@@ -318,8 +313,8 @@ class CalculatorRouter:
             transport_cost=info.get("transport_cost", 0),
             accommodation_cost=info.get("accommodation_cost", 0),
             trip_days=info.get("trip_days", 0),
-            cities_count=info.get("cities_count", 1),  
-            addresses_count=info.get("addresses_count", 1),  
+            cities_count=info.get("cities_count", 1),
+            addresses_count=info.get("addresses_count", 1),
         )
 
     # ==================== Комбинированный ====================
@@ -328,37 +323,38 @@ class CalculatorRouter:
     ) -> CalculationResult:
         total_cost = 0.0
         total_recommended = 0.0
+        total_transport = 0.0
+        total_subcontractor = 0.0
+        total_guarantee = 0.0
+
         parts = []
         subtypes = []
 
-        # v7.5.0: Поддержка СОУТ + ОПР + Обучение + ПЛК
-        if info.get("rm_total"):
-            sout = self._calc_sout(info)
-            total_cost += sout.cost_price
-            total_recommended += sout.recommended_price
-            parts.append(sout.to_dict())
-            subtypes.append("sout")
+        sub_calcs = [
+            ("rm_total", "sout", self._calc_sout),
+            ("measurement_points", "plk", lambda i: self._calc_plk(i, documents_text)),
+            ("opr_positions", "opr", lambda i: self._calc_opr(i, documents_text)),
+            (
+                "students_count",
+                "education",
+                lambda i: self._calc_education(i, documents_text),
+            ),
+        ]
 
-        if info.get("measurement_points") or info.get("points_count"):
-            plk = self._calc_plk(info, documents_text)
-            total_cost += plk.cost_price
-            total_recommended += plk.recommended_price
-            parts.append(plk.to_dict())
-            subtypes.append("plk")
-
-        if info.get("opr_positions") or info.get("opr_persons"):
-            opr = self._calc_opr(info, documents_text)
-            total_cost += opr.cost_price
-            total_recommended += opr.recommended_price
-            parts.append(opr.to_dict())
-            subtypes.append("opr")
-
-        if info.get("students_count"):
-            edu = self._calc_education(info, documents_text)
-            total_cost += edu.cost_price
-            total_recommended += edu.recommended_price
-            parts.append(edu.to_dict())
-            subtypes.append("education")
+        for trigger_key, name, calc_func in sub_calcs:
+            if (
+                info.get(trigger_key)
+                or (name == "plk" and info.get("points_count"))
+                or (name == "opr" and info.get("opr_persons"))
+            ):
+                sub_res: CalculationResult = calc_func(info)
+                total_cost += sub_res.cost_price
+                total_recommended += sub_res.recommended_price
+                total_transport += sub_res.transport_cost
+                total_subcontractor += sub_res.subcontractor_cost
+                total_guarantee += sub_res.guarantee_cost
+                parts.append(sub_res.to_dict())
+                subtypes.append(name)
 
         if not parts:
             return self._manual_review(
@@ -378,8 +374,9 @@ class CalculatorRouter:
             recommended_price=total_recommended,
             margin_percent=margin_percent,
             margin_rub=margin_rub,
-            transport_cost=0.0,
-            subcontractor_cost=0.0,
+            transport_cost=total_transport,
+            subcontractor_cost=total_subcontractor,
+            guarantee_cost=total_guarantee,
             needs_manual_review=True,
             review_reason=f"Комбинированный тендер ({'+'.join(subtypes)}) — требуется ручная проверка",
             details={"parts": parts, "subtypes": subtypes},
@@ -393,6 +390,7 @@ class CalculatorRouter:
             margin_rub=0.0,
             transport_cost=0.0,
             subcontractor_cost=0.0,
+            guarantee_cost=0.0,
             needs_manual_review=True,
             review_reason=reason,
         )
