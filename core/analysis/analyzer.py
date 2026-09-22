@@ -25,6 +25,7 @@ from core.services.type_service import TypeService
 from core.services.tender_classifier import TenderClassifierService
 from core.services.agent_service import AgentService
 from core.services.fallback_service import FallbackService
+from core.parsers.address_parser import AddressParser
 
 agent_logger = logger.bind(type="agent_thinking")
 
@@ -407,6 +408,39 @@ class TenderAnalyzer:
                         f"[{self.VERSION}] ✅ Подтверждено агентом: {key}={value}"
                     )
                     agent_logger.info(f"✅ ПОДТВЕРЖДЕНО: {key}={value}")
+                    
+        # Если агент дал 1, а Python нашёл больше — берём Python
+        parser_geo = AddressParser().count_addresses(documents_text or "")
+        if (tender_info.get("addresses_count") or 1) <= 1 and parser_geo["cities_count"] > 1:
+            tender_info["addresses_count"] = parser_geo["cities_count"]
+            tender_info["cities_count"] = parser_geo["cities_count"]
+            tender_info["regions_count"] = parser_geo["regions_count"]
+            logger.warning(
+                f"География: агент=1, берём от AddressParser "
+                f"({parser_geo['cities_count']} городов, {parser_geo['regions_count']} регионов)"
+            )
+
+        # === Обработка отказа / safety-фильтра агента ===
+        raw_response = extracted.get("raw_response") if extracted else None
+        if raw_response and isinstance(raw_response, str):
+            refusal_markers = [
+                "я не могу обсуждать",
+                "давайте поговорим о чём-нибудь ещё",
+                "i cannot discuss",
+                "i can't discuss",
+                "не могу обсуждать эту тему",
+            ]
+            if any(m in raw_response.lower() for m in refusal_markers):
+                logger.warning(
+                    f"[{self.VERSION}] Агент отказался анализировать {tender_id} (safety filter)"
+                )
+                agent_logger.warning(f"🚫 ОТКАЗ АГЕНТА (safety): {raw_response[:120]}")
+                tender_info["agent_blocked"] = True
+                tender_info["agent_block_reason"] = (
+                    "Агент отказался анализировать (safety filter)"
+                )
+                tender_info["needs_manual_review"] = True
+                return
 
     # ==================== Утилиты ====================
 

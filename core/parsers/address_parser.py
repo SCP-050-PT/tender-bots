@@ -135,6 +135,17 @@ class AddressParser:
                 # Нормализация
                 current_region = current_region.replace("респ.", "республика").title()
                 all_regions.add(current_region)
+                
+            text = text.replace("–", "-").replace("—", "-")
+
+            # Приоритетный сплит по маркированным спискам
+            lines = re.split(r"(?:^|\n)\s*[-–—•]\s+", text)
+            lines = [l.strip() for l in lines if l.strip() and len(l.strip()) > 8]
+
+            if len(lines) < 2:
+                # fallback по "г." / "город"
+                raw_lines = re.split(r"(?=г\.?\s+[А-Яа-яЁё]|город\s+[А-Яа-яЁё])", text)
+                lines = [l.strip() for l in raw_lines if l.strip() and len(l.strip()) > 10]
 
             # Регионы из справочника
             for region_name in RUSSIAN_REGIONS:
