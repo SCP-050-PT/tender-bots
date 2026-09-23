@@ -55,7 +55,11 @@ class TypeService:
         "производственного экологического контроля",
         "физико-химических показателей источников",
         "контроль выбросов",
-        "атмосферн",  # осторожно: может задеть atmospheric_air — см. ниже
+        "источников выбросов",
+        "предельно-допустимых выбросов",
+        "производственного экологического контроля",
+        "физико-химических показателей источников",
+        "контроль выбросов",
     ]
 
     # === ЕДИНСТВЕННЫЙ источник ключевых слов для всех типов ===
@@ -261,7 +265,7 @@ class TypeService:
             if neg_kw in full_text:
                 logger.warning(f"[{self.VERSION}] НЕГАТИВ: найдено '{neg_kw}' → other")
                 return "other", "negative_keyword", "heuristic"
-            
+
         # === Не ОПР: замеры воздуха / выбросы без маркеров ОПР ===
         air_or_emission = any(
             m in full_text
@@ -290,7 +294,7 @@ class TypeService:
                 f"[{self.VERSION}] Выбросы/ПЭК без маркеров ОПР → other (проверить аккредитацию)"
             )
             return "other", "emission_not_opr", "heuristic"
-        
+
         if any(
             m in full_text
             for m in (

@@ -118,9 +118,7 @@ def run_analyze(
 ):
     """Полный анализ с LLM."""
     logger.info("=" * 60)
-    logger.info(" РЕЖИМ: Полный анализ с LLM")
-    logger.info("    Логирование 'мышления' агента включено: logs/agent_thinking_*.log")
-
+    logger.info(" РЕЖИМ: Полный анализ с LLM. Логирование 'мышления' агента включено: logs/agent_thinking_*.log")
     limiter = DailyLimiter()
     logger.info(limiter.get_status())
 

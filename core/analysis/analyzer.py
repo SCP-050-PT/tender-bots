@@ -397,7 +397,6 @@ class TenderAnalyzer:
             if value is not None:
                 old_val = tender_info.get(key)
                 tender_info[key] = value
-
                 if old_val != value and old_val is not None:
                     logger.warning(
                         f"[{self.VERSION}] ⚠️ РАСХОЖДЕНИЕ в {tender_id}: {key} изменено с {old_val} на {value}"
@@ -408,10 +407,38 @@ class TenderAnalyzer:
                         f"[{self.VERSION}] ✅ Подтверждено агентом: {key}={value}"
                     )
                     agent_logger.info(f"✅ ПОДТВЕРЖДЕНО: {key}={value}")
-                    
-        # Если агент дал 1, а Python нашёл больше — берём Python
+
+        # === Пост-проверка аккредитации по measurement_types ===
+        blocked_factors = []
+        types_list = extracted.get("measurement_types") or []
+        if isinstance(types_list, list):
+            joined = " ".join(str(t).lower() for t in types_list)
+            for bad in (
+                "рентген", "радиац", "ионизир", "гамма", "амбиент",
+                "нейтрон", "смыв", "бактери", "гельминт", "асбест",
+            ):
+                if bad in joined:
+                    blocked_factors.append(bad)
+
+        if blocked_factors:
+            reason = (
+                f"Факторы вне аккредитации: {', '.join(blocked_factors)} (cannot_measure)"
+            )
+            logger.warning(f"[{self.VERSION}] АККРЕДИТАЦИЯ (post-agent): {reason}")
+            agent_logger.warning(f"🚫 АККРЕДИТАЦИЯ: {reason}")
+            tender_info["agent_blocked"] = True
+            tender_info["agent_block_reason"] = reason
+            tender_info["needs_manual_review"] = True
+            return
+
+        # === География: только если AddressParser надёжен ===
         parser_geo = AddressParser().count_addresses(documents_text or "")
-        if (tender_info.get("addresses_count") or 1) <= 1 and parser_geo["cities_count"] > 1:
+        agent_addr = tender_info.get("addresses_count") or 1
+        if (
+            agent_addr <= 1
+            and parser_geo.get("is_reliable")
+            and parser_geo.get("cities_count", 0) > 1
+        ):
             tender_info["addresses_count"] = parser_geo["cities_count"]
             tender_info["cities_count"] = parser_geo["cities_count"]
             tender_info["regions_count"] = parser_geo["regions_count"]
@@ -419,8 +446,13 @@ class TenderAnalyzer:
                 f"География: агент=1, берём от AddressParser "
                 f"({parser_geo['cities_count']} городов, {parser_geo['regions_count']} регионов)"
             )
+        elif parser_geo.get("cities_count", 0) > 1 and not parser_geo.get("is_reliable"):
+            logger.info(
+                f"[AddressParser] Найдено {parser_geo['cities_count']} «городов», "
+                f"но unreliable — оставляем агента ({agent_addr})"
+            )
 
-        # === Обработка отказа / safety-фильтра агента ===
+        # === Safety-отказ агента ===
         raw_response = extracted.get("raw_response") if extracted else None
         if raw_response and isinstance(raw_response, str):
             refusal_markers = [
