@@ -1,0 +1,8 @@
+[TYPE_HINT: plk]
+=== EXTRACT_PLK ===
+- measurement_points: точки замеров (ИТОГО/таблица).
+- measurement_types: список строк как в ТЗ (шум, микроклимат, …). Пиши «неионизирующие», не сокращай до «ионизир».
+- addresses_count, cities_count: по списку; нет → 1.
+
+JSON:
+{"type":"plk","measurement_points":число|null,"measurement_types":["..."],"addresses_count":число,"cities_count":число,"confidence":0.0-1.0}

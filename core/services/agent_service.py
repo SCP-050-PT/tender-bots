@@ -8,10 +8,8 @@ import re
 import time
 from typing import Optional, Dict, Any
 from loguru import logger
-
-from config.prompts import load_system_prompt
+from config.prompts import build_agent_system_prompt
 from utils.llm_client import YandexGPTClient
-
 
 class AgentService:
     """Сервис глубинного анализа документов через AI Studio Agent."""
@@ -43,11 +41,7 @@ class AgentService:
             context_override=context_override,
         )
 
-        system_prompt = (
-            "Ты — автономный AI Агент, аналитик тендеров в сфере охраны труда и промышленной безопасности. "
-            "Твоя задача — извлекать параметры и проводить верификацию документации. "
-            "Используй доступные инструменты и возвращай строго итоговый валидный JSON."
-        )
+        system_prompt = build_agent_system_prompt(tender_type)
 
         last_error = None
 
@@ -129,61 +123,24 @@ class AgentService:
         tender_id: str = "",
         context_override: str = None,
     ) -> str:
-        """Формирует промпт для Агента из system_prompt.txt."""
-        section_map = {
-            "sout": "EXTRACT_SOUT",
-            "education": "EXTRACT_EDUCATION",
-            "opr": "EXTRACT_OPR",
-            "plk": "EXTRACT_PLK",
-        }
+        """User-сообщение: контекст парсера + текст ТЗ. EXTRACT_* уже в system."""
+        text_limit = 30000 if tender_type == "education" else 25000
+        header = (
+            f"РЕГИСТРАЦИОННЫЙ НОМЕР ТЕНДЕРА: {tender_id}\n\n" if tender_id else ""
+        )
 
-        section_name = section_map.get(tender_type)
-        if not section_name:
-            return (
-                f"Извлеки параметры для типа {tender_type}:\n{documents_text[:15000]}"
+        verification_block = ""
+        if context_override:
+            verification_block = (
+                "=== КОНТЕКСТ ПАРСЕРА ===\n"
+                f"{context_override}\n"
+                "Верифицируй и дополни из ТЗ. Нет явной цифры — null, не выдумывай.\n\n"
             )
 
-        try:
-            full_prompt = load_system_prompt()
-            section_text = self._get_section(full_prompt, section_name)
-            if section_text:
-                text_limit = 30000 if tender_type == "education" else 15000
-                header = (
-                    f"РЕГИСТРАЦИОННЫЙ НОМЕР ТЕНДЕРА: {tender_id}\n\n"
-                    if tender_id
-                    else ""
-                )
-
-                verification_block = ""
-                if context_override:
-                    verification_block = f"""
-=== КОНТЕКСТ ВЕРИФИКАЦИИ (ДАННЫЕ ОТ ПАРСЕРА) ===
-{context_override}
-
-ТВОЯ ЗАДАЧА — ВЕРИФИЦИРОВАТЬ ВЫШЕУКАЗАННЫЕ ДАННЫЕ.
-=============================================
-"""
-
-                parts = [
-                    header,
-                    verification_block,
-                    section_text,
-                    "",
-                    f"Текст тендера:\n{documents_text[:text_limit]}",
-                    "Верни результат в формате JSON.",
-                ]
-                return "\n".join(parts)
-
-        except Exception as e:
-            logger.error(f"[{self.VERSION}] Ошибка загрузки промпта: {e}")
-
-        return f"Извлеки параметры для типа {tender_type}:\n{documents_text[:15000]}"
-
-    @staticmethod
-    def _get_section(prompt_text: str, section_name: str) -> str:
-        pattern = re.compile(
-            rf"===\s*{section_name}\s*===(.*?)(?====\s*\w+\s*===|\Z)",
-            re.DOTALL | re.IGNORECASE,
-        )
-        match = pattern.search(prompt_text)
-        return match.group(1).strip() if match else ""
+        parts = [
+            header,
+            verification_block,
+            f"Текст тендера:\n{(documents_text or '')[:text_limit]}",
+            "\nВерни результат строго в JSON.",
+        ]
+        return "".join(parts)

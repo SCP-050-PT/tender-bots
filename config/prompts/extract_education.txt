@@ -1,0 +1,10 @@
+[TYPE_HINT: education]
+=== EXTRACT_EDUCATION ===
+- students_count, protocols_count (=students для ОТ), qual_certs, diplomas, worker_certs, cert_pk
+- is_distance, teacher_days (~1 день на 25 слушателей), accommodation_nights, transport_km, delivery_count
+- contract_months, programs[{name,count,doc_type,unit_price,hours}], is_framework_contract, contract_end_date
+- total_unit_price_sum, estimated_students
+doc_type: protocol | qual_cert | diploma | worker_cert | cert_pk
+
+JSON:
+{"type":"education","students_count":число|null,"protocols_count":число|null,"qual_certs":число|null,"diplomas":число|null,"worker_certs":число|null,"cert_pk":число|null,"is_distance":true|false,"teacher_days":число|null,"accommodation_nights":число|null,"transport_km":число|null,"delivery_count":число|null,"contract_months":число|null,"programs":[...],"is_framework_contract":true|false,"contract_end_date":"YYYY-MM-DD"|null,"total_unit_price_sum":число|null,"estimated_students":число|null,"confidence":0.0-1.0}

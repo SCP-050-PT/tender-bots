@@ -1,0 +1,6 @@
+[TYPE_HINT: combined]
+=== EXTRACT_COMBINED ===
+Заполни только присутствующие блоки; остальные null. Географию — в каждом блоке, где уместно.
+
+JSON:
+{"type":"combined","sout":{...}|null,"plk":{...}|null,"education":{...}|null,"opr":{...}|null,"confidence":0.0-1.0}

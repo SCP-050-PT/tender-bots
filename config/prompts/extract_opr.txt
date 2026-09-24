@@ -1,0 +1,9 @@
+[TYPE_HINT: opr]
+=== EXTRACT_OPR ===
+- opr_positions: должности/позиции из таблицы ТЗ. Нет числа → null (не выдумывать).
+- opr_persons: работники или null.
+- risk_level: low|medium|high (по умолчанию medium).
+- addresses_count, cities_count: только явный список объектов; нет → 1.
+
+JSON:
+{"type":"opr","opr_positions":число|null,"opr_persons":число|null,"risk_level":"low|medium|high","addresses_count":число,"cities_count":число,"confidence":0.0-1.0,"is_estimated":true|false}

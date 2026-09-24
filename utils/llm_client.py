@@ -142,15 +142,17 @@ class YandexGPTClient:
         if self.provider == "timeweb" and self.timeweb_client:
             try:
                 logger.info("[LLM] Запрос в Timeweb (OpenAI-compatible)...")
-                response = self.timeweb_client.chat.completions.create(
-                    model="qwen",  # Timeweb игнорирует, берёт модель агента
-                    messages=[
+                create_kwargs = {
+                    "model": "qwen",  # Timeweb берёт модель агента
+                    "messages": [
                         {"role": "system", "content": sys},
                         {"role": "user", "content": full_user_prompt},
                     ],
-                    temperature=0.25,
-                    max_tokens=4000,
-                )
+                    "max_tokens": 4000,
+                }
+                # GPT-6 Luna / gpt-6* не принимают temperature
+                # если вернётесь на Qwen — можно снова добавить temperature=0.25
+                response = self.timeweb_client.chat.completions.create(**create_kwargs)
                 output_text = response.choices[0].message.content or ""
                 logger.info(f"📄 ТЕЛО ОТВЕТА TIMEWEB:\n{output_text[:2000]}")
                 parsed = self._extract_json(output_text)
@@ -224,15 +226,15 @@ class YandexGPTClient:
     ) -> str:
         """Единая точка completion для classify и простых вызовов."""
         if self.provider == "timeweb" and self.timeweb_client:
-            response = self.timeweb_client.chat.completions.create(
-                model="qwen",
-                messages=[
+            create_kwargs = {
+                "model": "qwen",
+                "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
+                "max_tokens": max_tokens,
+            }
+            response = self.timeweb_client.chat.completions.create(**create_kwargs)
             return response.choices[0].message.content or ""
         return self._fallback_completion(
             system_prompt, user_prompt, max_tokens, temperature

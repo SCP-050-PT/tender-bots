@@ -1,0 +1,10 @@
+[TYPE_HINT: sout]
+=== EXTRACT_SOUT ===
+Извлеки параметры СОУТ.
+- rm_total: число РМ (ИТОГО/ВСЕГО/таблицы). Нет цифры — оценка по объёму, is_estimated=true.
+- addresses_count, cities_count, regions_count: по списку объектов; нет списка → 1.
+- has_iii: true только ионизирующие/рентген/радиация.
+- seasonality: true для ЯНАО, ХМАО, Мурманск, Архангельск, Коми, Якутия, Камчатка, Магадан.
+
+JSON:
+{"type":"sout","rm_total":число,"addresses_count":число,"cities_count":число,"regions_count":число,"has_iii":true|false,"seasonality":true|false,"confidence":0.0-1.0,"is_estimated":true|false}
