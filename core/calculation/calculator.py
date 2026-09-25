@@ -170,13 +170,13 @@ class TenderCalculator:
             )
             review_reasons.append(f"Мин. цена по ТЗ: {min_sum:,.0f}₽.")
 
-        # 2. Проверка и корректировка маржи
+        # 2. Проверка и корректировка маржи (±0.3 п.п. — шум округления)
         min_margin = limits.get("min_margin_percent", 10.0)
         if cost_price > 0:
             actual_margin = ((recommended_price - cost_price) / cost_price) * 100
             adjusted_margin_percent = actual_margin
 
-            if round(actual_margin, 2) < min_margin:
+            if actual_margin + 0.3 < min_margin:
                 adjusted = cost_price * (1 + min_margin / 100)
                 adjusted_price = max(adjusted_price, adjusted)
                 adjusted_margin_percent = min_margin

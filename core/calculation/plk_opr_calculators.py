@@ -96,7 +96,9 @@ class PlkCalculator:
 
         # 3. Эвристика по количеству городов / объектов
         else:
-            effective_locations = max(cities_count, addresses_count)
+            cities_count = max(1, int(cities_count or 1))
+            addresses_count = max(1, int(addresses_count or 1))
+            effective_locations = min(max(cities_count, addresses_count), 5)
             trip_cost = travel.get("fixed_trip_cost", 4000)
 
             if effective_locations > 1:
@@ -265,7 +267,9 @@ class OprCalculator:
         final_accommodation_cost = 0
         final_daily_allowance = 0
 
-        effective_locations = max(cities_count, addresses_count)
+        cities_count = max(1, int(cities_count or 1))
+        addresses_count = max(1, int(addresses_count or 1))
+        effective_locations = min(max(cities_count, addresses_count), 5)
 
         if transport_cost > 0:
             logger.info(
@@ -315,12 +319,6 @@ class OprCalculator:
             recommended_price = 15000
             margin_rub = recommended_price - cost_price
             margin_percent = (margin_rub / cost_price) * 100 if cost_price > 0 else 0
-
-        if margin_percent > 20.0:
-            logger.warning(
-                f"[OprCalc v7.8.2] ВНИМАНИЕ: margin_percent из конфига = {margin_percent}%. "
-                f"Ожидалось ~10%. Проверьте costs_db.json → opr.margin_percent"
-            )
 
         return CalculationResult(
             cost_price=cost_price,

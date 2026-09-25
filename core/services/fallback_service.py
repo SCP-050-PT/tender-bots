@@ -139,16 +139,15 @@ class FallbackService:
                         f"(НМЦК {nmck:,.0f} / {price_per_unit})"
                     )
 
-        # --- 5. OPR ---
+                # --- 5. OPR ---
         elif tender_type == "opr" and not tender_info.get("opr_positions"):
             estimated = int(round(nmck / price_per_unit))
+            estimated = min(estimated, 80)  # жёсткий потолок
             if estimated > 0:
                 tender_info["opr_positions"] = estimated
                 tender_info["opr_positions_source"] = "nmck_estimate"
+                tender_info["needs_manual_review"] = True
                 logger.info(
                     f"[{FallbackService.VERSION}] FALLBACK opr: "
-                    f"estimated_positions={estimated} "
-                    f"(НМЦК {nmck:,.0f} / {price_per_unit})"
+                    f"estimated_positions={estimated} (cap 80, НМЦК {nmck:,.0f})"
                 )
-
-        return tender_info

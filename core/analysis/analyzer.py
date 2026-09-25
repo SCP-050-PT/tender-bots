@@ -392,6 +392,7 @@ class TenderAnalyzer:
             return
 
         agent_logger.info(f"🔄 СРАВНЕНИЕ ДАННЫХ ПАРСЕРА И АГЕНТА ДЛЯ {tender_id}:")
+        pre_agent_students = int(tender_info.get("students_count") or 0)
 
         for key, value in extracted.items():
             if value is not None:
@@ -408,21 +409,106 @@ class TenderAnalyzer:
                     )
                     agent_logger.info(f"✅ ПОДТВЕРЖДЕНО: {key}={value}")
 
-        # === Пост-проверка аккредитации по measurement_types ===
+        # === Education: students = уникальные люди, protocols = сумма документов ===
+        if tender_type == "education":
+            programs = tender_info.get("programs") or []
+            if isinstance(programs, list) and programs:
+                doc_sum = 0
+                unique_candidates = []
+                for p in programs:
+                    if not isinstance(p, dict):
+                        continue
+                    cnt = int(p.get("count") or 0)
+                    if cnt <= 0:
+                        continue
+                    unique_candidates.append(cnt)
+                    doc_type = (p.get("doc_type") or "protocol").lower()
+                    if doc_type in ("protocol", "протокол"):
+                        doc_sum += cnt
+                    elif doc_type in ("diploma", "диплом"):
+                        tender_info["diplomas"] = (
+                            int(tender_info.get("diplomas") or 0) + cnt
+                        )
+                    elif doc_type in ("certificate", "удостоверение", "cert"):
+                        tender_info["certificates"] = (
+                            int(tender_info.get("certificates") or 0) + cnt
+                        )
+                    elif doc_type in ("qual_cert", "свидетельство", "pk"):
+                        tender_info["qual_certs"] = (
+                            int(tender_info.get("qual_certs") or 0) + cnt
+                        )
+                    else:
+                        doc_sum += cnt
+
+
+                # Уникальные слушатели: КТРУ (до агента) важнее суммы программ
+                if pre_agent_students > 0:
+                    unique_students = pre_agent_students
+                elif unique_candidates:
+                    unique_students = max(unique_candidates)
+                else:
+                    unique_students = int(tender_info.get("students_count") or 0)
+
+                if unique_students > 0:
+                    old = tender_info.get("students_count")
+                    tender_info["students_count"] = unique_students
+                    if old and int(old) != unique_students:
+                        logger.info(
+                            f"[{self.VERSION}] Education students: "
+                            f"{old} → {unique_students} (unique/KTRU, not sum)"
+                        )
+                if doc_sum > 0 and not tender_info.get("protocols_count"):
+                    tender_info["protocols_count"] = doc_sum
+                elif doc_sum > 0:
+                    # protocols не меньше суммы protocol-программ
+                    tender_info["protocols_count"] = max(
+                        int(tender_info.get("protocols_count") or 0), doc_sum
+                    )
+
+        # === Пост-проверка аккредитации (без lookbehind, без ложных срабатываний) ===
         blocked_factors = []
         types_list = extracted.get("measurement_types") or []
         if isinstance(types_list, list):
-            joined = " ".join(str(t).lower() for t in types_list)
-            for bad in (
-                "рентген", "радиац", "ионизир", "гамма", "амбиент",
-                "нейтрон", "смыв", "бактери", "гельминт", "асбест",
-            ):
-                if bad in joined:
-                    blocked_factors.append(bad)
+            SAFE = (
+                "неионизир",
+                "уф-ради",
+                "уф ради",
+                "уф-",
+                "ультрафиолет",
+                "бактериальн",  # обсеменённость воздуха — не смывы
+            )
+            BLOCK = (
+                "рентген",
+                "гамма-изл",
+                "гамма изл",
+                "амбиентн",
+                "нейтронн",
+                "смыв",
+                "бактериологич",
+                "гельминт",
+                "асбест",
+                "ионизирующ",
+                "ионизир. изл",
+            )
+            for raw in types_list:
+                t = str(raw).lower().strip()
+                if any(s in t for s in SAFE):
+                    continue
+                # «радиация» без УФ
+                if "радиац" in t and "уф" not in t and "ультрафиолет" not in t:
+                    blocked_factors.append("радиация")
+                    continue
+                if "ионизир" in t and "неионизир" not in t:
+                    blocked_factors.append("ионизирующие")
+                    continue
+                for needle in BLOCK:
+                    if needle in t:
+                        blocked_factors.append(needle)
+                        break
 
         if blocked_factors:
             reason = (
-                f"Факторы вне аккредитации: {', '.join(blocked_factors)} (cannot_measure)"
+                f"Факторы вне аккредитации: {', '.join(sorted(set(blocked_factors)))}"
             )
             logger.warning(f"[{self.VERSION}] АККРЕДИТАЦИЯ (post-agent): {reason}")
             agent_logger.warning(f"🚫 АККРЕДИТАЦИЯ: {reason}")
@@ -431,26 +517,67 @@ class TenderAnalyzer:
             tender_info["needs_manual_review"] = True
             return
 
-        # === География: только если AddressParser надёжен ===
+        # === География: приоритет надёжного AddressParser + кап раздутого агента ===
         parser_geo = AddressParser().count_addresses(documents_text or "")
-        agent_addr = tender_info.get("addresses_count") or 1
-        if (
-            agent_addr <= 1
-            and parser_geo.get("is_reliable")
-            and parser_geo.get("cities_count", 0) > 1
-        ):
-            tender_info["addresses_count"] = parser_geo["cities_count"]
-            tender_info["cities_count"] = parser_geo["cities_count"]
-            tender_info["regions_count"] = parser_geo["regions_count"]
-            logger.warning(
-                f"География: агент=1, берём от AddressParser "
-                f"({parser_geo['cities_count']} городов, {parser_geo['regions_count']} регионов)"
-            )
-        elif parser_geo.get("cities_count", 0) > 1 and not parser_geo.get("is_reliable"):
-            logger.info(
-                f"[AddressParser] Найдено {parser_geo['cities_count']} «городов», "
-                f"но unreliable — оставляем агента ({agent_addr})"
-            )
+        agent_addr = int(tender_info.get("addresses_count") or 1)
+        agent_cities = int(tender_info.get("cities_count") or 1)
+        agent_regions = int(tender_info.get("regions_count") or 1)
+
+        p_cities = int(parser_geo.get("cities_count") or 0)
+        p_regions = int(parser_geo.get("regions_count") or 0)
+        p_reliable = bool(parser_geo.get("is_reliable"))
+
+        if p_reliable and p_cities >= 1:
+            # Надёжный парсер важнее агента (агент часто раздувает филиалы)
+            if agent_addr > p_cities or agent_cities > p_cities:
+                logger.warning(
+                    f"[{self.VERSION}] Гео: агент={agent_addr}, берём AddressParser "
+                    f"({p_cities} городов, {p_regions} регионов)"
+                )
+            tender_info["cities_count"] = max(1, p_cities)
+            tender_info["addresses_count"] = max(1, p_cities)
+            tender_info["regions_count"] = max(1, p_regions)
+        else:
+            # Парсер слабый — капаем агента, чтобы не раздувать транспорт
+            regions = max(1, agent_regions)
+            cities = max(1, agent_cities)
+            addrs = max(1, agent_addr)
+
+            if regions <= 1:
+                # Один регион: максимум 3 точки выезда
+                capped = min(max(cities, addrs), 3)
+                if max(cities, addrs) > 3:
+                    logger.warning(
+                        f"[{self.VERSION}] Гео-кап (1 регион): "
+                        f"cities/addr {max(cities, addrs)} → {capped}"
+                    )
+                    tender_info["needs_manual_review"] = True
+                tender_info["cities_count"] = capped
+                tender_info["addresses_count"] = capped
+                tender_info["regions_count"] = 1
+            else:
+                # Несколько регионов: кап по регионам (не больше 4 выездов)
+                trip_cap = min(regions, 4)
+                if max(cities, addrs) > trip_cap:
+                    logger.warning(
+                        f"[{self.VERSION}] Гео-кап (multi-region): "
+                        f"cities/addr {max(cities, addrs)} → {trip_cap} "
+                        f"(regions={regions})"
+                    )
+                    tender_info["needs_manual_review"] = True
+                tender_info["cities_count"] = trip_cap
+                tender_info["addresses_count"] = trip_cap
+                tender_info["regions_count"] = min(regions, 4)
+
+        logger.info(
+            f"[AddressParser] Городов: {parser_geo.get('cities_count', 0)}, "
+            f"Регионов: {parser_geo.get('regions_count', 0)}, "
+            f"Выездов: {parser_geo.get('trips_count', 0)} | "
+            f"Города: {parser_geo.get('cities', [])} | "
+            f"reliable={p_reliable} | "
+            f"итог addresses={tender_info.get('addresses_count')}, "
+            f"cities={tender_info.get('cities_count')}"
+        )
 
         # === Safety-отказ агента ===
         raw_response = extracted.get("raw_response") if extracted else None

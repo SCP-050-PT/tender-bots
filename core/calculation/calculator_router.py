@@ -161,6 +161,8 @@ class CalculatorRouter:
             protocols_count=doc_types.get("protocols", 0),
             qual_certs=doc_types.get("qual_certs", 0),
             diplomas=doc_types.get("diplomas", 0),
+            certificates=doc_types.get("certificates", 0),
+            worker_certs=doc_types.get("worker_certs", 0),
             is_distance=info.get("is_distance", False),
             teacher_days=info.get("teacher_days", 0),
             transport_km=info.get("transport_km", 0),
@@ -177,36 +179,70 @@ class CalculatorRouter:
         )
 
     def _detect_education_docs(self, info: Dict[str, Any], text: str) -> Dict[str, int]:
-        text_lower = text.lower()
-        students = info.get("students_count", 0)
+        """Документы: сначала programs[] от агента, потом явные поля, потом эвристика."""
+        text_lower = (text or "").lower()
+        students = int(info.get("students_count") or 0)
 
+        result = {
+            "protocols": 0,
+            "qual_certs": 0,
+            "diplomas": 0,
+            "certificates": 0,
+            "worker_certs": 0,
+        }
+
+        programs = info.get("programs") or []
+        if isinstance(programs, list) and programs:
+            for p in programs:
+                if not isinstance(p, dict):
+                    continue
+                cnt = int(p.get("count") or 0)
+                if cnt <= 0:
+                    continue
+                doc_type = (p.get("doc_type") or "protocol").lower()
+                if doc_type in ("protocol", "протокол"):
+                    result["protocols"] += cnt
+                elif doc_type in ("diploma", "диплом"):
+                    result["diplomas"] += cnt
+                elif doc_type in ("certificate", "удостоверение", "cert"):
+                    result["certificates"] += cnt
+                elif doc_type in ("qual_cert", "свидетельство", "pk", "certificate_qualification"):
+                    result["qual_certs"] += cnt
+                elif doc_type in ("worker_cert", "свидетельство рабоч"):
+                    result["worker_certs"] += cnt
+                else:
+                    result["protocols"] += cnt
+            if any(result.values()):
+                return result
+
+        # Явные поля от агента / парсера
+        for key in ("protocols", "qual_certs", "diplomas", "certificates", "worker_certs"):
+            src = {
+                "protocols": "protocols_count",
+                "qual_certs": "qual_certs",
+                "diplomas": "diplomas",
+                "certificates": "certificates",
+                "worker_certs": "worker_certs",
+            }[key]
+            val = int(info.get(src) or 0)
+            if val > 0:
+                result[key] = val
+        if any(result.values()):
+            return result
+
+        # Эвристика по тексту
         if "охрана труда" in text_lower or "обучение по охране труда" in text_lower:
-            return {"protocols": students, "qual_certs": 0, "diplomas": 0}
+            return {"protocols": students, "qual_certs": 0, "diplomas": 0, "certificates": 0, "worker_certs": 0}
 
-        protocols = info.get("protocols_count", 0)
-        qual_certs = info.get("qual_certs", 0)
-        diplomas = info.get("diplomas", 0)
+        if "переподготовка" in text_lower or "пожарная безопасность" in text_lower:
+            if "удостоверение" in text_lower:
+                return {"protocols": 0, "qual_certs": 0, "diplomas": 0, "certificates": students, "worker_certs": 0}
+            return {"protocols": 0, "qual_certs": 0, "diplomas": students, "certificates": 0, "worker_certs": 0}
 
-        if protocols > 0 or qual_certs > 0 or diplomas > 0:
-            return {
-                "protocols": protocols,
-                "qual_certs": qual_certs,
-                "diplomas": diplomas,
-            }
+        if "повышение квалификации" in text_lower:
+            return {"protocols": 0, "qual_certs": students, "diplomas": 0, "certificates": 0, "worker_certs": 0}
 
-        if "переподготовка" in text_lower or "повышение квалификации" in text_lower:
-            if "пожарн" in text_lower and (
-                "удостоверение" in text_lower or "удостоверения" in text_lower
-            ):
-                return {
-                    "protocols": 0,
-                    "qual_certs": 0,
-                    "diplomas": 0,
-                    "certificates": students,
-                }
-            return {"protocols": 0, "qual_certs": students, "diplomas": 0}
-
-        return {"protocols": students, "qual_certs": 0, "diplomas": 0}
+        return {"protocols": students, "qual_certs": 0, "diplomas": 0, "certificates": 0, "worker_certs": 0}
 
     # ==================== ОПР ====================
     def _calc_opr(

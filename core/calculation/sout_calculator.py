@@ -159,8 +159,16 @@ class SoutCalculator:
         seasonal_mult = self.travel.get("seasonal_multiplier", 2) if is_seasonal else 1
 
         # Количество поездок рассчитывается по максимальному числу локаций
-        effective_locations = max(regions_count, cities_count, addresses_count)
-        trips = max(1, effective_locations)
+        regions_count = max(1, int(regions_count or 1))
+        cities_count = max(1, int(cities_count or 1))
+        addresses_count = max(1, int(addresses_count or 1))
+
+        # Выезды ≈ регионы; города/адреса только как мягкий множитель с капом
+        if regions_count <= 1:
+            trips = min(max(cities_count, addresses_count), 3)
+        else:
+            trips = max(regions_count, min(cities_count, regions_count * 2))
+        trips = max(1, trips)
 
         # Если передана точная стоимость транспорта — берём её
         if transport_cost > 0:
