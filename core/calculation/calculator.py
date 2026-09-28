@@ -54,6 +54,7 @@ class TenderCalculator:
     def calculate_opr(self, **kwargs) -> CalculationResult:
         """Расчёт ОПР."""
         return self.opr_calc.calculate(**kwargs)
+    
 
     # ==================== Глобальные затраты ====================
 

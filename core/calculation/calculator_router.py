@@ -245,12 +245,13 @@ class CalculatorRouter:
         return {"protocols": students, "qual_certs": 0, "diplomas": 0, "certificates": 0, "worker_certs": 0}
 
     # ==================== ОПР ====================
+
     def _calc_opr(
         self, info: Dict[str, Any], documents_text: str = ""
     ) -> CalculationResult:
-        positions = info.get("opr_positions", 0)
-        persons = info.get("opr_persons", 0)
-        nmck = info.get("nmck", 0)
+        positions = info.get("opr_positions", 0) or 0
+        persons = info.get("opr_persons", 0) or 0
+        nmck = info.get("nmck", 0) or 0
 
         if documents_text:
             text_lower = documents_text.lower()
@@ -274,67 +275,74 @@ class CalculatorRouter:
             if nmck > 0:
                 estimated_rm = int(nmck / 700)
                 logger.warning(
-                    f"[{self.VERSION}] ОПР: кол-во не найдено. Оценка по НМЦК: {estimated_rm} РМ"
+                    f"[{self.VERSION}] ОПР: кол-во не найдено. Оценка по НМЦК: {estimated_rm}"
                 )
                 positions = estimated_rm
                 info["needs_manual_review"] = True
                 info["review_reason"] = (
-                    "Количество РМ не найдено, использована оценка по НМЦК"
+                    "Количество должностей не найдено, оценка по НМЦК"
                 )
+                info["opr_positions_source"] = "nmck_estimate"
             else:
                 return self._manual_review(
-                    "Не определено количество РМ/должностей и нет НМЦК для оценки"
+                    "Не определено количество РМ/должностей и нет НМЦК"
                 )
 
         return self.calculator.calculate_opr(
-            rm_count=info.get("rm_total", 0),
+            rm_count=info.get("rm_total", 0) or 0,
             opr_positions=positions,
             opr_persons=persons,
-            delivery_count=info.get("delivery_count", 1),
+            delivery_count=info.get("delivery_count", 1) or 1,
             needs_siz_norms=info.get("needs_siz_norms", False),
             needs_dsiz_norms=info.get("needs_dsiz_norms", False),
             needs_iot_norms=info.get("needs_iot_norms", False),
-            transport_cost=info.get("transport_cost", 0),
-            trip_days=info.get("trip_days", 0),
-            cities_count=info.get("cities_count", 1),
-            addresses_count=info.get("addresses_count", 1),
+            transport_cost=info.get("transport_cost", 0) or 0,
+            trip_days=info.get("trip_days", 0) or 0,
+            cities_count=info.get("cities_count", 1) or 1,
+            addresses_count=info.get("addresses_count", 1) or 1,
+            is_remote_region=bool(info.get("is_remote_region", False)),
+            opr_positions_source=info.get("opr_positions_source") or "из ТЗ",
         )
 
     # ==================== ПЛК ====================
     def _calc_plk(
         self, info: Dict[str, Any], documents_text: str = ""
     ) -> CalculationResult:
-        points = info.get("measurement_points", 0) or info.get("points_count", 0)
-        measurement_types = info.get("measurement_types", [])
-
+        points = info.get("measurement_points", 0) or info.get("points_count", 0) or 0
+        measurement_types = info.get("measurement_types", []) or []
         needs_subcontractor = info.get("needs_subcontractor", False)
 
         if measurement_types and self.accreditation:
             cannot_measure = set(self.accreditation.get("cannot_measure", []))
             forbidden_found = []
-
             for factor in measurement_types:
-                f_lower = factor.lower()
+                f_lower = str(factor).lower()
                 if any(
                     cm.lower() in f_lower or f_lower in cm.lower()
                     for cm in cannot_measure
                 ):
                     forbidden_found.append(factor)
-
             if forbidden_found:
-                reason = f"Факторы вне аккредитации: {', '.join(forbidden_found)}"
+                reason = (
+                    f"Факторы вне аккредитации: {', '.join(map(str, forbidden_found))}"
+                )
                 logger.warning(f"[{self.VERSION}] ПЛК: {reason}")
                 needs_subcontractor = True
                 info["needs_manual_review"] = True
                 info["review_reason"] = reason
 
+        points_source = (
+            info.get("points_source")
+            or info.get("measurement_points_source")
+            or "из ТЗ"
+        )
+
         if not points:
-            nmck = info.get("nmck", 0)
+            nmck = info.get("nmck", 0) or 0
             if nmck > 0:
                 points = int(nmck / 500)
-                logger.warning(
-                    f"[{self.VERSION}] ПЛК: кол-во точек не найдено. Оценка: {points}"
-                )
+                points_source = "nmck_estimate"
+                logger.warning(f"[{self.VERSION}] ПЛК: точек нет. Оценка: {points}")
                 info["needs_manual_review"] = True
             else:
                 return self._manual_review("Не определено количество точек замера")
@@ -342,15 +350,17 @@ class CalculatorRouter:
         return self.calculator.calculate_plk(
             points_count=points,
             factors_count=len(measurement_types),
-            delivery_count=info.get("delivery_count", 1),
+            delivery_count=info.get("delivery_count", 1) or 1,
             is_annual=info.get("is_annual", False),
             needs_subcontractor=needs_subcontractor,
-            distance_km=info.get("distance_km", 0),
-            transport_cost=info.get("transport_cost", 0),
-            accommodation_cost=info.get("accommodation_cost", 0),
-            trip_days=info.get("trip_days", 0),
-            cities_count=info.get("cities_count", 1),
-            addresses_count=info.get("addresses_count", 1),
+            distance_km=info.get("distance_km", 0) or 0,
+            transport_cost=info.get("transport_cost", 0) or 0,
+            accommodation_cost=info.get("accommodation_cost", 0) or 0,
+            trip_days=info.get("trip_days", 0) or 0,
+            cities_count=info.get("cities_count", 1) or 1,
+            addresses_count=info.get("addresses_count", 1) or 1,
+            is_remote_region=bool(info.get("is_remote_region", False)),
+            points_source=points_source,
         )
 
     # ==================== Комбинированный ====================

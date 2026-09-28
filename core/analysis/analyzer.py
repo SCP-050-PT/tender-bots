@@ -120,6 +120,57 @@ class TenderAnalyzer:
 
         return tender_type, type_source, method
 
+    def _apply_excel_quantities(self, tender_info: dict, documents_text: str, tender_type: str) -> None:
+        """Парсит маркеры ExcelExtractor: === ИЗВЛЕЧЕНО ИЗ ТАБЛИЦЫ: Количество = N ==="""
+        if not documents_text:
+            return
+        found = [int(x) for x in re.findall(
+            r"=== ИЗВЛЕЧЕНО ИЗ ТАБЛИЦЫ:\s*Количество\s*=\s*(\d+)",
+            documents_text,
+            flags=re.IGNORECASE,
+        )]
+        if not found:
+            # запасной паттерн из enriched rows
+            found = [int(x) for x in re.findall(
+                r"Количество\s*=\s*(\d{1,5})",
+                documents_text[:8000],
+            )]
+        if not found:
+            return
+
+        # Берём разумное значение: для НМЦК часто одна строка (114), не сумма мусора
+        qty = max(found)
+        # отсекаем явный мусор
+        if qty < 1 or qty > 50000:
+            return
+
+        if tender_type == "opr" and not tender_info.get("opr_positions"):
+            tender_info["opr_positions"] = qty
+            tender_info["opr_positions_source"] = "excel_nmck"
+            logger.info(f"[{self.VERSION}] Excel→opr_positions={qty}")
+
+        elif tender_type in ("sout", "sout_opr") and not tender_info.get("rm_total"):
+            # для СОУТ предпочитаем значение ближе к НМЦК/800..2500
+            nmck = float(tender_info.get("nmck") or 0)
+            candidates = found
+            if nmck > 0:
+                scored = sorted(
+                    candidates,
+                    key=lambda q: abs(nmck / q - 1200) if q else 1e18,
+                )
+                qty = scored[0]
+            tender_info["rm_total"] = qty
+            tender_info["rm_total_source"] = "excel_nmck"
+            logger.info(f"[{self.VERSION}] Excel→rm_total={qty}")
+
+        elif tender_type == "plk" and not (
+            tender_info.get("measurement_points") or tender_info.get("points_count")
+        ):
+            tender_info["measurement_points"] = qty
+            tender_info["points_count"] = qty
+            tender_info["points_source"] = "excel_nmck"
+            logger.info(f"[{self.VERSION}] Excel→measurement_points={qty}")
+
     def analyze(
         self,
         tender_info: Dict[str, Any],
@@ -159,8 +210,10 @@ class TenderAnalyzer:
             tender_info["agent_block_reason"] = (
                 f"Непрофильный тип тендера: {tender_type}"
             )
+
         else:
-            # Вызываем Агента
+            # Excel до агента — чтобы context_override уже содержал qty
+            self._apply_excel_quantities(tender_info, documents_text, tender_type)
             self._verify_with_agent(tender_info, documents_text, tender_type)
 
         # === БЛОКИРОВКА И FALLBACK ===
@@ -172,6 +225,8 @@ class TenderAnalyzer:
             agent_logger.error(f"❌ Fallback отменен для {tender_id}: {reason}")
         else:
             logger.info(f"[{self.VERSION}] Запуск fallback-оценок...")
+
+            self._apply_excel_quantities(tender_info, documents_text, tender_type)
             self.fallback_service.apply(tender_info, tender_type)
 
             nmck = tender_info.get("nmck", 0)
@@ -394,21 +449,55 @@ class TenderAnalyzer:
         agent_logger.info(f"🔄 СРАВНЕНИЕ ДАННЫХ ПАРСЕРА И АГЕНТА ДЛЯ {tender_id}:")
         pre_agent_students = int(tender_info.get("students_count") or 0)
 
-        for key, value in extracted.items():
-            if value is not None:
-                old_val = tender_info.get(key)
-                tender_info[key] = value
-                if old_val != value and old_val is not None:
-                    logger.warning(
-                        f"[{self.VERSION}] ⚠️ РАСХОЖДЕНИЕ в {tender_id}: {key} изменено с {old_val} на {value}"
-                    )
-                    agent_logger.warning(f"⚠️ РАСХОЖДЕНИЕ: {key} {old_val} → {value}")
-                else:
-                    logger.info(
-                        f"[{self.VERSION}] ✅ Подтверждено агентом: {key}={value}"
-                    )
-                    agent_logger.info(f"✅ ПОДТВЕРЖДЕНО: {key}={value}")
+        # Поля, которые Excel уже заполнил — агент не имеет права их затирать
+        PROTECTED = {
+            "rm_total": "rm_total_source",
+            "opr_positions": "opr_positions_source",
+            "measurement_points": "points_source",
+            "points_count": "points_source",
+        }
 
+        for key, value in extracted.items():
+            if value is None:
+                continue
+            if key.startswith("_"):
+                continue
+
+            src_key = PROTECTED.get(key)
+            if src_key:
+                src = str(tender_info.get(src_key) or "").lower()
+                old = tender_info.get(key)
+                if "excel" in src and old is not None and int(old or 0) > 0:
+                    logger.info(
+                        f"[{self.VERSION}] Excel защищён: {key}={old} "
+                        f"(агент хотел {value}, source={tender_info.get(src_key)})"
+                    )
+                    agent_logger.info(
+                        f"🛡️ EXCEL: {key} оставлен {old}, агент {value} отклонён"
+                    )
+                    continue
+
+            old_val = tender_info.get(key)
+            tender_info[key] = value
+            if old_val != value and old_val is not None:
+                logger.warning(
+                    f"[{self.VERSION}] ⚠️ РАСХОЖДЕНИЕ в {tender_id}: "
+                    f"{key} изменено с {old_val} на {value}"
+                )
+                agent_logger.warning(f"⚠️ РАСХОЖДЕНИЕ: {key} {old_val} → {value}")
+            else:
+                logger.info(
+                    f"[{self.VERSION}] ✅ Подтверждено агентом: {key}={value}"
+                )
+                agent_logger.info(f"✅ ПОДТВЕРЖДЕНО: {key}={value}")
+
+        # Синхронизация points
+        if tender_info.get("measurement_points") and not tender_info.get("points_count"):
+            tender_info["points_count"] = tender_info["measurement_points"]
+        elif tender_info.get("points_count") and not tender_info.get("measurement_points"):
+            tender_info["measurement_points"] = tender_info["points_count"]
+        if tender_info.get("measurement_points"):
+            tender_info["points_count"] = tender_info["measurement_points"]
         # === Education: students = уникальные люди, protocols = сумма документов ===
         if tender_type == "education":
             programs = tender_info.get("programs") or []
@@ -439,7 +528,6 @@ class TenderAnalyzer:
                         )
                     else:
                         doc_sum += cnt
-
 
                 # Уникальные слушатели: КТРУ (до агента) важнее суммы программ
                 if pre_agent_students > 0:
@@ -517,67 +605,50 @@ class TenderAnalyzer:
             tender_info["needs_manual_review"] = True
             return
 
-        # === География: приоритет надёжного AddressParser + кап раздутого агента ===
+        # === География ===
         parser_geo = AddressParser().count_addresses(documents_text or "")
-        agent_addr = int(tender_info.get("addresses_count") or 1)
-        agent_cities = int(tender_info.get("cities_count") or 1)
-        agent_regions = int(tender_info.get("regions_count") or 1)
-
+        agent_addr = int(tender_info.get("addresses_count") or 0)
+        agent_cities = int(tender_info.get("cities_count") or 0)
         p_cities = int(parser_geo.get("cities_count") or 0)
-        p_regions = int(parser_geo.get("regions_count") or 0)
+        p_regions = int(parser_geo.get("regions_count") or 1)
         p_reliable = bool(parser_geo.get("is_reliable"))
 
-        if p_reliable and p_cities >= 1:
-            # Надёжный парсер важнее агента (агент часто раздувает филиалы)
-            if agent_addr > p_cities or agent_cities > p_cities:
-                logger.warning(
-                    f"[{self.VERSION}] Гео: агент={agent_addr}, берём AddressParser "
-                    f"({p_cities} городов, {p_regions} регионов)"
-                )
-            tender_info["cities_count"] = max(1, p_cities)
-            tender_info["addresses_count"] = max(1, p_cities)
+        # 1) Агент дал 1, парсер надёжно нашёл больше → берём парсер
+        if agent_addr <= 1 and agent_cities <= 1 and p_reliable and p_cities > 1:
+            tender_info["addresses_count"] = p_cities
+            tender_info["cities_count"] = p_cities
             tender_info["regions_count"] = max(1, p_regions)
-        else:
-            # Парсер слабый — капаем агента, чтобы не раздувать транспорт
-            regions = max(1, agent_regions)
-            cities = max(1, agent_cities)
-            addrs = max(1, agent_addr)
-
-            if regions <= 1:
-                # Один регион: максимум 3 точки выезда
-                capped = min(max(cities, addrs), 3)
-                if max(cities, addrs) > 3:
-                    logger.warning(
-                        f"[{self.VERSION}] Гео-кап (1 регион): "
-                        f"cities/addr {max(cities, addrs)} → {capped}"
-                    )
-                    tender_info["needs_manual_review"] = True
-                tender_info["cities_count"] = capped
-                tender_info["addresses_count"] = capped
-                tender_info["regions_count"] = 1
-            else:
-                # Несколько регионов: кап по регионам (не больше 4 выездов)
-                trip_cap = min(regions, 4)
-                if max(cities, addrs) > trip_cap:
-                    logger.warning(
-                        f"[{self.VERSION}] Гео-кап (multi-region): "
-                        f"cities/addr {max(cities, addrs)} → {trip_cap} "
-                        f"(regions={regions})"
-                    )
-                    tender_info["needs_manual_review"] = True
-                tender_info["cities_count"] = trip_cap
-                tender_info["addresses_count"] = trip_cap
-                tender_info["regions_count"] = min(regions, 4)
-
-        logger.info(
-            f"[AddressParser] Городов: {parser_geo.get('cities_count', 0)}, "
-            f"Регионов: {parser_geo.get('regions_count', 0)}, "
-            f"Выездов: {parser_geo.get('trips_count', 0)} | "
-            f"Города: {parser_geo.get('cities', [])} | "
-            f"reliable={p_reliable} | "
-            f"итог addresses={tender_info.get('addresses_count')}, "
-            f"cities={tender_info.get('cities_count')}"
+            logger.warning(
+                f"[{self.VERSION}] Гео: агент=1, берём AddressParser "
+                f"({p_cities} городов, {p_regions} регионов)"
+            )
+        # 2) Агент дал много (>=3), парсер 0–1 → ОСТАВЛЯЕМ агента (кейс Красноярский край)
+        elif max(agent_addr, agent_cities) >= 3 and p_cities <= 1:
+            logger.info(
+                f"[{self.VERSION}] Гео: агент={max(agent_addr, agent_cities)}, "
+                f"parser={p_cities} — оставляем агента"
+            )
+        # 3) Кап
+        cities = max(
+            int(tender_info.get("cities_count") or 1),
+            int(tender_info.get("addresses_count") or 1),
         )
+        regions = int(tender_info.get("regions_count") or 1)
+        if regions <= 1:
+            capped = min(cities, 3)
+        else:
+            capped = min(cities, 4)
+        if cities > capped:
+            logger.warning(
+                f"[{self.VERSION}] Гео-кап: {cities} → {capped} (regions={regions})"
+            )
+            tender_info["cities_count"] = capped
+            tender_info["addresses_count"] = capped
+
+        # Удалённый регион для транспорта (дом — Свердловская / Екб)
+        region = (tender_info.get("region") or tender_info.get("customer_region") or "").lower()
+        home_markers = ("свердлов", "екатеринбург", "екат")
+        tender_info["is_remote_region"] = bool(region) and not any(h in region for h in home_markers)
 
         # === Safety-отказ агента ===
         raw_response = extracted.get("raw_response") if extracted else None

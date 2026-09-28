@@ -1,17 +1,12 @@
 """
 Единый сервис fallback-оценок по НМЦК.
-Заменяет: analyzer FALLBACK sout/plk/education, llm_wrapper._fallback_estimate().
-
-ИСПРАВЛЕНО:
-  - Тип 'testing' вынесен в общий словарь COEFFICIENTS во избежание магии чисел.
-  - Улучшена безопасность деления.
+v7.1.2: унификация points_source / measurement_points_source.
 """
 
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 from datetime import datetime
 from loguru import logger
 
-# === ЕДИНСТВЕННЫЙ источник коэффициентов ===
 COEFFICIENTS = {
     "sout": {"price_per_unit": 1200, "unit_name": "РМ"},
     "plk": {"price_per_unit": 170, "unit_name": "точек"},
@@ -22,17 +17,11 @@ COEFFICIENTS = {
 
 
 class FallbackService:
-    """Оценка параметров по НМЦК когда LLM/КТРУ не дали данных."""
-
-    VERSION = "v7.1.1"
+    VERSION = "v7.1.2"
 
     @staticmethod
     def apply(tender_info: Dict[str, Any], tender_type: str) -> Dict[str, Any]:
-        """
-        Применяет fallback-оценки для недостающих параметров.
-        Модифицирует tender_info in-place и возвращает его.
-        """
-        nmck = tender_info.get("nmck", 0)
+        nmck = tender_info.get("nmck", 0) or 0
         if nmck <= 0:
             return tender_info
 
@@ -41,9 +30,7 @@ class FallbackService:
             return tender_info
 
         price_per_unit = coeff["price_per_unit"]
-        unit_name = coeff["unit_name"]
 
-        # --- 1. SOUT ---
         if tender_type == "sout" and not tender_info.get("rm_total"):
             estimated = int(round(nmck / price_per_unit))
             if estimated > 0:
@@ -54,29 +41,30 @@ class FallbackService:
                     f"estimated_rm={estimated} (НМЦК {nmck:,.0f} / {price_per_unit})"
                 )
 
-        # --- 2. PLK ---
         elif tender_type == "plk" and not tender_info.get("measurement_points"):
             estimated = int(round(nmck / price_per_unit))
             if estimated > 0:
                 tender_info["measurement_points"] = estimated
+                tender_info["points_count"] = estimated
+                tender_info["points_source"] = "nmck_estimate"
                 tender_info["measurement_points_source"] = "nmck_estimate"
                 logger.info(
                     f"[{FallbackService.VERSION}] FALLBACK plk: "
                     f"estimated_points={estimated} (НМЦК {nmck:,.0f} / {price_per_unit})"
                 )
 
-        # --- 3. TESTING ---
         elif tender_type == "testing" and not tender_info.get("measurement_points"):
             estimated = int(round(nmck / price_per_unit))
             if estimated > 0:
                 tender_info["measurement_points"] = estimated
+                tender_info["points_count"] = estimated
+                tender_info["points_source"] = "nmck_estimate_testing"
                 tender_info["measurement_points_source"] = "nmck_estimate_testing"
                 logger.info(
                     f"[{FallbackService.VERSION}] FALLBACK testing: "
-                    f"estimated_points={estimated} (НМЦК {nmck:,.0f} / {price_per_unit})"
+                    f"estimated_points={estimated}"
                 )
 
-        # --- 4. EDUCATION ---
         elif tender_type == "education":
             programs = tender_info.get("programs")
             if programs and not tender_info.get("students_count"):
@@ -89,15 +77,14 @@ class FallbackService:
                 if estimated > 0:
                     tender_info["students_count"] = estimated
                     tender_info["estimated_students"] = estimated
+                    tender_info["students_count_source"] = "nmck_estimate"
 
-                    # protocols_count для Guard в калькуляторе
                     protocol_programs = [
                         p for p in programs if p.get("doc_type") == "protocol"
                     ]
                     if protocol_programs and not tender_info.get("protocols_count"):
                         tender_info["protocols_count"] = estimated
 
-                    # Срок договора в месяцах
                     contract_end = tender_info.get("contract_end_date")
                     if contract_end and not tender_info.get("contract_months"):
                         try:
@@ -119,18 +106,15 @@ class FallbackService:
 
                     logger.info(
                         f"[{FallbackService.VERSION}] Programs→scalar: "
-                        f"estimated_students={estimated}, "
-                        f"total_unit_sum={total_unit_sum}, "
-                        f"programs_count={len(programs)}, "
-                        f"contract_months={tender_info.get('contract_months')}"
+                        f"estimated_students={estimated}"
                     )
 
-            # Fallback без programs[]
             elif not programs and not tender_info.get("students_count"):
                 estimated = int(round(nmck / price_per_unit))
                 if estimated > 0:
                     tender_info["students_count"] = estimated
                     tender_info["estimated_students"] = estimated
+                    tender_info["students_count_source"] = "nmck_estimate"
                     if not tender_info.get("protocols_count"):
                         tender_info["protocols_count"] = estimated
                     logger.info(
@@ -139,15 +123,18 @@ class FallbackService:
                         f"(НМЦК {nmck:,.0f} / {price_per_unit})"
                     )
 
-                # --- 5. OPR ---
         elif tender_type == "opr" and not tender_info.get("opr_positions"):
             estimated = int(round(nmck / price_per_unit))
-            estimated = min(estimated, 80)  # жёсткий потолок
-            if estimated > 0:
-                tender_info["opr_positions"] = estimated
-                tender_info["opr_positions_source"] = "nmck_estimate"
+            estimated = min(estimated, 500)
+            # НМЦК > 5 млн при «ОПР» почти наверняка чужой профиль
+            if nmck >= 5_000_000:
                 tender_info["needs_manual_review"] = True
-                logger.info(
-                    f"[{FallbackService.VERSION}] FALLBACK opr: "
-                    f"estimated_positions={estimated} (cap 80, НМЦК {nmck:,.0f})"
+                tender_info["agent_blocked"] = True
+                tender_info["agent_block_reason"] = (
+                    f"Подозрительно большой НМЦК для ОПР ({nmck:,.0f} ₽) — "
+                    "возможна диагностика/стройка, не оценка рисков"
                 )
+                logger.warning(
+                    f"[{FallbackService.VERSION}] OPR blocked: NMCK={nmck:,.0f}"
+                )
+                return tender_info

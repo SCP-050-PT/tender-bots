@@ -1,17 +1,31 @@
 """
 utils/formatters.py
 Вспомогательные функции для форматирования данных, дат, текста для Google Sheets и логирования.
-Версия: v7.8.0
+Версия: v7.8.1 — SOURCE_LABELS для excel_nmck / nmck_estimate.
 """
 
 import re
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 from loguru import logger
+
+SOURCE_LABELS = {
+    "excel_nmck": "из Excel НМЦК",
+    "nmck_estimate": "оценка по НМЦК",
+    "fallback_nmck": "оценка по НМЦК",
+    "agent": "из ТЗ",
+    "из ТЗ": "из ТЗ",
+}
+
+
+def _label_source(raw: Any) -> str:
+    if not raw:
+        return "из ТЗ"
+    s = str(raw)
+    return SOURCE_LABELS.get(s, s)
 
 
 def parse_deadline_to_days(deadline_date_str: str) -> int:
-    """Парсит строку даты дедлайна в количество дней до него."""
     if not deadline_date_str:
         return 30
 
@@ -39,7 +53,6 @@ def parse_deadline_to_days(deadline_date_str: str) -> int:
 
 
 def sanitize_for_sheets(text: str) -> str:
-    """Заменяет эмодзи на текстовые маркеры для Google Sheets во избежание сбоев кодировки."""
     if not isinstance(text, str):
         return str(text) if text is not None else ""
 
@@ -64,22 +77,19 @@ def sanitize_for_sheets(text: str) -> str:
 
     emoji_pattern = re.compile(
         "["
-        "\U0001f600-\U0001f64f"  # emoticons
-        "\U0001f300-\U0001f5ff"  # symbols & pictographs
-        "\U0001f680-\U0001f6ff"  # transport & map symbols
-        "\U0001f1e0-\U0001f1ff"  # flags (iOS)
+        "\U0001f600-\U0001f64f"
+        "\U0001f300-\U0001f5ff"
+        "\U0001f680-\U0001f6ff"
+        "\U0001f1e0-\U0001f1ff"
         "\U00002702-\U000027b0"
         "\U000024c2-\U0001f251"
         "]+",
         flags=re.UNICODE,
     )
-    result = emoji_pattern.sub("", result)
-
-    return result
+    return emoji_pattern.sub("", result)
 
 
 def get_quantity(analysis: Any) -> int:
-    """Извлекает итоговое количество (РМ/слушателей/точек) из объекта анализа."""
     if not hasattr(analysis, "details") or analysis.details is None:
         return 1
 
@@ -92,6 +102,7 @@ def get_quantity(analysis: Any) -> int:
             or details.get("points_count")
             or details.get("students_count")
             or details.get("opr_positions")
+            or details.get("base_count")
         )
     else:
         quantity = (
@@ -99,12 +110,12 @@ def get_quantity(analysis: Any) -> int:
             or getattr(details, "points_count", None)
             or getattr(details, "students_count", None)
             or getattr(details, "opr_positions", None)
+            or getattr(details, "base_count", None)
         )
 
     if quantity and int(quantity) > 0:
         return int(quantity)
 
-    # Fallback расчет по НМЦК, если парсер не вытащил точное количество
     nmck = getattr(analysis, "nmck", 0) or 0
     ttype = getattr(analysis, "tender_type", "")
     if nmck > 0 and ttype:
@@ -118,7 +129,6 @@ def get_quantity(analysis: Any) -> int:
 
 
 def build_calculation_breakdown(analysis: Any) -> str:
-    """Формирует детальную разбивку расчётов для колонки Q (Расчёты)."""
     if not hasattr(analysis, "details") or analysis.details is None:
         return ""
 
@@ -131,10 +141,9 @@ def build_calculation_breakdown(analysis: Any) -> str:
     tender_type = details.get("type", getattr(analysis, "tender_type", ""))
     lines = []
 
-    # === СОУТ ===
     if tender_type == "sout":
         lines.append("СОУТ (Единая формула)")
-        rm_source = details.get("rm_total_source", "из ТЗ")
+        rm_source = _label_source(details.get("rm_total_source"))
         rm_count = details.get("rm_total", "?")
         lines.append(
             f"РМ всего: {rm_count} ({rm_source}) × {details.get('base_rate_per_rm', 213)}₽"
@@ -163,12 +172,11 @@ def build_calculation_breakdown(analysis: Any) -> str:
             f"Регионов: {details.get('regions_count', 1)}, Дней: {details.get('trip_days', 3)}"
         )
 
-    # === ОБУЧЕНИЕ ===
     elif tender_type == "education":
         lines.append(
             f"Обучение | {'Дистант' if details.get('is_distance') else 'Очно'}"
         )
-        students_source = details.get("students_count_source", "из ТЗ")
+        students_source = _label_source(details.get("students_count_source"))
         lines.append(
             f"Слушателей: {details.get('students_count', '?')} ({students_source})"
         )
@@ -190,19 +198,23 @@ def build_calculation_breakdown(analysis: Any) -> str:
         if not details.get("is_distance"):
             lines.append(f"Очные затраты: {details.get('full_time_cost', 0):,.0f}₽")
 
-    # === ОПР ===
     elif tender_type == "opr":
         lines.append("ОПР (Оценка проф. рисков)")
-        positions_source = details.get("opr_positions_source", "из ТЗ")
-        positions = details.get("opr_positions", details.get("positions_count", "?"))
+        positions_source = _label_source(details.get("opr_positions_source"))
+        positions = (
+            details.get("opr_positions")
+            or details.get("positions_count")
+            or details.get("base_count")
+            or "?"
+        )
         lines.append(f"Должностей: {positions} ({positions_source})")
         lines.append(f"База (работы): {details.get('position_cost', 0):,.0f}₽")
         lines.append(f"Материалы: {details.get('materials_cost', 0):,.0f}₽")
         lines.append(f"Доставка: {details.get('delivery_cost', 0):,.0f}₽")
 
-        transport = details.get("transport_cost", 0)
-        accom = details.get("accommodation_cost", 0)
-        daily = details.get("daily_allowance", 0)
+        transport = details.get("transport_cost", 0) or 0
+        accom = details.get("accommodation_cost", 0) or 0
+        daily = details.get("daily_allowance", 0) or 0
 
         if transport > 0 or accom > 0 or daily > 0:
             lines.append("Логистика:")
@@ -212,25 +224,29 @@ def build_calculation_breakdown(analysis: Any) -> str:
                 lines.append(f"  Проживание: {accom:,.0f}₽")
             if daily > 0:
                 lines.append(f"  Суточные: {daily:,.0f}₽")
+        else:
+            lines.append("Транспорт: 0₽ (местный / нет данных)")
 
         if details.get("additional_cost", 0) > 0:
             lines.append(f"СИЗ/ДСИЗ/ИОТ: {details.get('additional_cost', 0):,.0f}₽")
 
-    # === ПЛК ===
     elif tender_type == "plk":
         lines.append("ПЛК (Производственный контроль)")
-        points_source = details.get("points_source", "из ТЗ")
+        points_source = _label_source(
+            details.get("points_source") or details.get("measurement_points_source")
+        )
         points = details.get("points_count", "?")
         lines.append(f"Точек замеров: {points} ({points_source})")
         lines.append(
-            f"База (замеры): {details.get('points_cost', 0) + details.get('measurer_cost', 0):,.0f}₽"
+            f"База (замеры): "
+            f"{(details.get('points_cost', 0) or 0) + (details.get('measurer_cost', 0) or 0):,.0f}₽"
         )
         lines.append(f"Материалы: {details.get('materials_cost', 0):,.0f}₽")
         lines.append(f"Доставка: {details.get('delivery_cost', 0):,.0f}₽")
 
-        transport = details.get("transport_cost", 0)
-        accom = details.get("accommodation_cost", 0)
-        daily = details.get("daily_allowance", 0)
+        transport = details.get("transport_cost", 0) or 0
+        accom = details.get("accommodation_cost", 0) or 0
+        daily = details.get("daily_allowance", 0) or 0
 
         if transport > 0 or accom > 0 or daily > 0:
             lines.append("Логистика:")
@@ -258,7 +274,6 @@ def build_calculation_breakdown(analysis: Any) -> str:
 
 
 def build_short_recommendation(analysis: Any) -> str:
-    """Формирует сжатую рекомендацию для колонки S (Рекомендации)."""
     parts = [
         f"Тип: {getattr(analysis, 'tender_type', 'unknown')}",
         f"Себестоимость: {getattr(analysis, 'cost_price', 0):,.0f} ₽",
@@ -279,7 +294,6 @@ def build_short_recommendation(analysis: Any) -> str:
 
 
 def log_pipeline_summary(stats: Dict[str, int]) -> None:
-    """Печатает красивую итоговую статистику выполнения скрипта в консоль."""
     logger.info("=" * 60)
     logger.info("📊 ИТОГИ ВЫПОЛНЕНИЯ ПАЙПЛАЙНА:")
     logger.info(f"   • Всего найдено закупок:     {stats.get('total', 0)}")
