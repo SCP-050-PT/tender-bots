@@ -2,15 +2,18 @@
 core/parsers/ktru_parser.py
 Парсинг КТРУ из common-info (44-ФЗ) и lot-list (223-ФЗ).
 
-v7.5.0:
-  - Добавлен Sanity Check для защиты от абсурдных значений (P0-1)
-  - Умный парсер для обучения с детекцией инверсии колонок
-  - Передача nmck для валидации
-  - Замена суммирования на max(unique) для обучения
+v7.6.0:
+  - Qty из ЕИС не сбрасывается по «рыночной» цене 800₽/РМ
+  - Себестоимость тендеров — costs_db (СОУТ base_cost_per_rm=213 и т.д.)
+  - Сброс только при явном мусоре парсинга / инверсии колонок
+  - rm_total_source / students_count_source / points_source / opr_positions_source = ktru
 """
 
+from __future__ import annotations
+
 import re
-from typing import Dict, Any, Optional, List
+from typing import Any, Dict, List, Optional
+
 from bs4 import BeautifulSoup
 from loguru import logger
 
@@ -18,17 +21,18 @@ from loguru import logger
 class KtruParser:
     """Извлекает количества из КТРУ (44-ФЗ) и lot-list (223-ФЗ)."""
 
-    # Минимальные рыночные цены за единицу (руб) для sanity check
-    MIN_PRICES = {
-        "education": 1500,  # Минимум за слушателя (дистант)
-        "sout": 800,  # Минимум за РМ
-        "opr": 500,  # Минимум за должность
-        "plk": 300,  # Минимум за точку
+    # Низкая цена в извещении — только WARNING, не обнуление qty.
+    # Не путать с себестоимостью из costs_db (СОУТ 213 ₽/РМ и т.п.).
+    LOW_UNIT_PRICE_WARN = {
+        "education": 500,
+        "sout": 150,
+        "opr": 100,
+        "plk": 30,
     }
 
     @staticmethod
     def parse(soup: BeautifulSoup, nmck: float = 0) -> Dict[str, Any]:
-        result = {
+        result: Dict[str, Any] = {
             "rm_total": None,
             "students_count": None,
             "points_count": None,
@@ -36,6 +40,10 @@ class KtruParser:
             "unit_type": None,
             "price_per_unit": None,
             "ktru_confidence": 0.0,
+            "rm_total_source": None,
+            "students_count_source": None,
+            "points_source": None,
+            "opr_positions_source": None,
         }
 
         table_container = soup.find("div", id="purchaseObjectTruTable1")
@@ -54,11 +62,10 @@ class KtruParser:
 
         rows = table.find_all("tr", {"class": "tableBlock__row"})
 
-        # Собираем данные по типам
-        rm_data = {"qty": [], "prices": []}
-        person_data = {"qty": [], "prices": []}
-        point_data = {"qty": []}
-        position_data = {"qty": []}
+        rm_data: Dict[str, List[float]] = {"qty": [], "prices": []}
+        person_data: Dict[str, List[float]] = {"qty": [], "prices": []}
+        point_data: Dict[str, List[float]] = {"qty": []}
+        position_data: Dict[str, List[float]] = {"qty": []}
 
         for row in rows:
             if "tableBlock__foot" in " ".join(row.get("class", [])):
@@ -119,58 +126,82 @@ class KtruParser:
                 if qty:
                     position_data["qty"].append(qty)
 
-        # Обработка РМ
+        # --- РМ (СОУТ) ---
         if rm_data["qty"]:
             total_rm = sum(rm_data["qty"])
-            sanitized_rm = KtruParser._sanitize_quantity(total_rm, nmck, "sout")
+            avg_price = (
+                sum(rm_data["prices"]) / len(rm_data["prices"])
+                if rm_data["prices"]
+                else None
+            )
+            if rm_data["qty"] and rm_data["prices"] and nmck > 0:
+                try:
+                    n = min(len(rm_data["qty"]), len(rm_data["prices"]))
+                    line_sum = sum(
+                        rm_data["qty"][i] * rm_data["prices"][i] for i in range(n)
+                    )
+                    if abs(line_sum - nmck) / max(nmck, 1) < 0.05:
+                        logger.info(
+                            f"[KTRU] qty×price ≈ НМЦК ({line_sum:,.0f} ≈ {nmck:,.0f}) — qty канон"
+                        )
+                except Exception:
+                    pass
+
+            sanitized_rm = KtruParser._sanitize_quantity(
+                total_rm, nmck, "sout", price_per_unit=avg_price
+            )
             if sanitized_rm > 0:
                 result["rm_total"] = int(sanitized_rm)
+                result["rm_total_source"] = "ktru"
                 result["unit_type"] = "rm"
                 result["ktru_confidence"] = 1.0
-                if rm_data["prices"]:
-                    result["price_per_unit"] = sum(rm_data["prices"]) / len(
-                        rm_data["prices"]
-                    )
+                if avg_price:
+                    result["price_per_unit"] = avg_price
                 logger.info(
-                    f"[KTRU] Найдено {result['rm_total']} РМ ({len(rm_data['qty'])} позиций)"
+                    f"[KTRU] Найдено {result['rm_total']} РМ "
+                    f"({len(rm_data['qty'])} позиций, source=ktru)"
                 )
             else:
                 logger.warning(
-                    f"[KTRU] Sanity Check: РМ={total_rm} сброшено в 0 (НМЦК={nmck})"
+                    f"[KTRU] РМ={total_rm} сброшены как мусор парсинга (НМЦК={nmck})"
                 )
 
-        # Обработка обучения (умный парсер)
+        # --- Обучение ---
         elif person_data["qty"]:
             students = KtruParser._parse_education_smart(person_data, nmck)
             if students and students > 0:
                 result["students_count"] = int(students)
+                result["students_count_source"] = "ktru"
                 result["unit_type"] = "person"
                 result["ktru_confidence"] = 1.0
                 logger.info(
-                    f"[KTRU] Найдено {result['students_count']} слушателей ({len(person_data['qty'])} позиций)"
+                    f"[KTRU] Найдено {result['students_count']} слушателей "
+                    f"({len(person_data['qty'])} позиций, source=ktru)"
                 )
             else:
                 logger.warning(
-                    f"[KTRU] Sanity Check: Слушатели сброшены в 0 (НМЦК={nmck})"
+                    f"[KTRU] Слушатели сброшены (мусор/инверсия, НМЦК={nmck})"
                 )
 
-        # Обработка точек ПЛК
+        # --- ПЛК ---
         elif point_data["qty"]:
             total_points = sum(point_data["qty"])
             sanitized_points = KtruParser._sanitize_quantity(total_points, nmck, "plk")
             if sanitized_points > 0:
                 result["points_count"] = int(sanitized_points)
+                result["points_source"] = "ktru"
                 result["unit_type"] = "point"
                 result["ktru_confidence"] = 1.0
                 logger.info(
-                    f"[KTRU] Найдено {result['points_count']} точек ({len(point_data['qty'])} позиций)"
+                    f"[KTRU] Найдено {result['points_count']} точек "
+                    f"({len(point_data['qty'])} позиций, source=ktru)"
                 )
             else:
                 logger.warning(
-                    f"[KTRU] Sanity Check: Точки={total_points} сброшены в 0 (НМЦК={nmck})"
+                    f"[KTRU] Точки={total_points} сброшены как мусор (НМЦК={nmck})"
                 )
 
-        # Обработка должностей ОПР
+        # --- ОПР ---
         elif position_data["qty"]:
             total_positions = sum(position_data["qty"])
             sanitized_positions = KtruParser._sanitize_quantity(
@@ -178,27 +209,33 @@ class KtruParser:
             )
             if sanitized_positions > 0:
                 result["opr_positions"] = int(sanitized_positions)
+                result["opr_positions_source"] = "ktru"
                 result["unit_type"] = "position"
                 result["ktru_confidence"] = 1.0
                 logger.info(
-                    f"[KTRU] Найдено {result['opr_positions']} должностей ({len(position_data['qty'])} позиций)"
+                    f"[KTRU] Найдено {result['opr_positions']} должностей "
+                    f"({len(position_data['qty'])} позиций, source=ktru)"
                 )
             else:
                 logger.warning(
-                    f"[KTRU] Sanity Check: Должности={total_positions} сброшены в 0 (НМЦК={nmck})"
+                    f"[KTRU] Должности={total_positions} сброшены как мусор (НМЦК={nmck})"
                 )
 
         return result
 
     @staticmethod
     def parse_223_lot_list(soup: BeautifulSoup, nmck: float = 0) -> Dict[str, Any]:
-        result = {
+        result: Dict[str, Any] = {
             "rm_total": None,
             "students_count": None,
             "points_count": None,
             "opr_positions": None,
             "unit_type": None,
             "ktru_confidence": 0.0,
+            "rm_total_source": None,
+            "students_count_source": None,
+            "points_source": None,
+            "opr_positions_source": None,
         }
 
         table = soup.find("table", {"class": "table"})
@@ -208,10 +245,10 @@ class KtruParser:
 
         rows = table.find_all("tr")
 
-        rm_qtys = []
-        person_qtys = []
-        point_qtys = []
-        position_qtys = []
+        rm_qtys: List[int] = []
+        person_qtys: List[int] = []
+        point_qtys: List[int] = []
+        position_qtys: List[int] = []
 
         for row in rows:
             if row.find("th"):
@@ -221,55 +258,52 @@ class KtruParser:
                 continue
 
             lot_name = cols[0].get_text(strip=True).lower() if len(cols) > 0 else ""
-            qty = 0
 
             rm_match = re.search(r"(\d+)\s*рабоч", lot_name)
             if rm_match:
-                qty = int(rm_match.group(1))
-                rm_qtys.append(qty)
+                rm_qtys.append(int(rm_match.group(1)))
                 continue
 
             person_match = re.search(r"(\d+)\s*(?:человек|слушател)", lot_name)
             if person_match:
-                qty = int(person_match.group(1))
-                person_qtys.append(qty)
+                person_qtys.append(int(person_match.group(1)))
                 continue
 
             point_match = re.search(r"(\d+)\s*(?:точ|замер)", lot_name)
             if point_match:
-                qty = int(point_match.group(1))
-                point_qtys.append(qty)
+                point_qtys.append(int(point_match.group(1)))
                 continue
 
             position_match = re.search(r"(\d+)\s*(?:должност|позиц)", lot_name)
             if position_match:
-                qty = int(position_match.group(1))
-                position_qtys.append(qty)
+                position_qtys.append(int(position_match.group(1)))
                 continue
 
-        # Обработка с sanity check
         if rm_qtys:
             total = sum(rm_qtys)
             sanitized = KtruParser._sanitize_quantity(total, nmck, "sout")
             if sanitized > 0:
                 result["rm_total"] = int(sanitized)
+                result["rm_total_source"] = "ktru"
                 result["unit_type"] = "rm"
                 result["ktru_confidence"] = 0.8
                 logger.info(
-                    f"[KTRU-223] Найдено {result['rm_total']} РМ ({len(rm_qtys)} лотов)"
+                    f"[KTRU-223] Найдено {result['rm_total']} РМ "
+                    f"({len(rm_qtys)} лотов, source=ktru)"
                 )
 
         elif person_qtys:
-            # Для 223-ФЗ тоже применяем умную логику, если есть данные
             unique_persons = set(person_qtys)
             students = max(unique_persons) if unique_persons else sum(person_qtys)
             sanitized = KtruParser._sanitize_quantity(students, nmck, "education")
             if sanitized > 0:
                 result["students_count"] = int(sanitized)
+                result["students_count_source"] = "ktru"
                 result["unit_type"] = "person"
                 result["ktru_confidence"] = 0.8
                 logger.info(
-                    f"[KTRU-223] Найдено {result['students_count']} слушателей ({len(person_qtys)} лотов)"
+                    f"[KTRU-223] Найдено {result['students_count']} слушателей "
+                    f"({len(person_qtys)} лотов, source=ktru)"
                 )
 
         elif point_qtys:
@@ -277,10 +311,12 @@ class KtruParser:
             sanitized = KtruParser._sanitize_quantity(total, nmck, "plk")
             if sanitized > 0:
                 result["points_count"] = int(sanitized)
+                result["points_source"] = "ktru"
                 result["unit_type"] = "point"
                 result["ktru_confidence"] = 0.8
                 logger.info(
-                    f"[KTRU-223] Найдено {result['points_count']} точек ({len(point_qtys)} лотов)"
+                    f"[KTRU-223] Найдено {result['points_count']} точек "
+                    f"({len(point_qtys)} лотов, source=ktru)"
                 )
 
         elif position_qtys:
@@ -288,30 +324,59 @@ class KtruParser:
             sanitized = KtruParser._sanitize_quantity(total, nmck, "opr")
             if sanitized > 0:
                 result["opr_positions"] = int(sanitized)
+                result["opr_positions_source"] = "ktru"
                 result["unit_type"] = "position"
                 result["ktru_confidence"] = 0.8
                 logger.info(
-                    f"[KTRU-223] Найдено {result['opr_positions']} должностей ({len(position_qtys)} лотов)"
+                    f"[KTRU-223] Найдено {result['opr_positions']} должностей "
+                    f"({len(position_qtys)} лотов, source=ktru)"
                 )
 
         return result
 
     @staticmethod
-    def _sanitize_quantity(quantity: float, nmck: float, tender_type: str) -> float:
-        """Защита от абсурдных значений из КТРУ (P0-1)."""
+    def _sanitize_quantity(
+        quantity: float,
+        nmck: float,
+        tender_type: str,
+        price_per_unit: Optional[float] = None,
+    ) -> float:
+        """
+        Qty из КТРУ — объём из ЕИС.
+        Не сравнивать с себестоимостью costs_db (213 ₽/РМ и т.п.).
+        Сброс только при явном мусоре парсинга.
+        """
         if not quantity or quantity <= 0:
             return 0
 
-        min_price = KtruParser.MIN_PRICES.get(tender_type, 1000)
-
-        # Если количество × мин_цена > НМЦК × 2 — явная ошибка парсинга
-        if nmck > 0 and (quantity * min_price) > (nmck * 2):
+        if quantity > 100_000:
             logger.warning(
-                f"⚠️ SANITY CHECK: КТРУ дал {quantity} ({tender_type}), но "
-                f"{quantity} × {min_price}₽ = {quantity * min_price:,.0f}₽ >> НМЦК {nmck:,.0f}₽. "
-                f"Сбрасываем в 0 для fallback."
+                f"[KTRU] Sanity: qty={quantity} > 100000 → сброс (мусор парсинга)"
             )
             return 0
+
+        if nmck > 0:
+            unit_from_nmck = nmck / quantity
+            # Похоже на перепутанные колонки (огромный qty, копейки за единицу)
+            if unit_from_nmck < 20 and quantity > 100:
+                logger.warning(
+                    f"[KTRU] Sanity: qty={quantity}, НМЦК/qty={unit_from_nmck:.1f}₽ "
+                    f"→ сброс (похоже на инверсию колонок)"
+                )
+                return 0
+
+            warn_floor = KtruParser.LOW_UNIT_PRICE_WARN.get(tender_type, 50)
+            ppu = (
+                price_per_unit
+                if price_per_unit and price_per_unit > 0
+                else unit_from_nmck
+            )
+            if ppu < warn_floor:
+                logger.warning(
+                    f"[KTRU] Низкая цена в извещении: ~{ppu:.0f}₽/ед. "
+                    f"(тип {tender_type}, qty={quantity}, НМЦК={nmck:,.0f}). "
+                    f"Qty оставляем; экономика — в калькуляторе (costs_db)."
+                )
 
         return quantity
 
@@ -324,16 +389,13 @@ class KtruParser:
         if not qtys:
             return 0
 
-        # Детекция инверсии: если "количество" содержит большие числа (>100),
-        # а "цена за ед." — маленькие (<100), значит реальное кол-во людей в "цене за ед."
         avg_qty = sum(qtys) / len(qtys) if qtys else 0
         avg_price = sum(prices) / len(prices) if prices else 0
 
         if avg_qty > 100 and 0 < avg_price < 100:
-            # Количество людей — в колонке "цена за ед."
             unique_people = set(int(p) for p in prices if p > 0)
             if unique_people:
-                students = max(unique_people)  # Берём максимум (основная группа)
+                students = max(unique_people)
                 logger.info(
                     f"[KTRU] Обнаружена инверсия колонок: "
                     f"'количество'={avg_qty:.0f} (это цена), "
@@ -342,8 +404,6 @@ class KtruParser:
                 )
                 return KtruParser._sanitize_quantity(students, nmck, "education")
 
-        # Стандартная логика: берем max(unique) вместо суммы
-        # (одни и те же люди проходят несколько программ)
         unique_qtys = set(int(q) for q in qtys if q > 0)
         if unique_qtys:
             students = max(unique_qtys)

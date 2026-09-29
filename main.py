@@ -98,9 +98,15 @@ def build_tender_text(detail, documents_text: str, tender_info: dict = None) -> 
                 f"   Слушатели: {tender_info['students_count']} ({tender_info.get('students_count_source', 'парсер')})"
             )
         if tender_info.get("points_count"):
-            ktru_parts.append(f"   Точки ПЛК: {tender_info['points_count']}")
+            ktru_parts.append(
+                f"   Точки ПЛК: {tender_info['points_count']} "
+                f"({tender_info.get('points_source', 'парсер')})"
+            )
         if tender_info.get("opr_positions"):
-            ktru_parts.append(f"   Должности ОПР: {tender_info['opr_positions']}")
+            ktru_parts.append(
+                f"   Должности ОПР: {tender_info['opr_positions']} "
+                f"({tender_info.get('opr_positions_source', 'парсер')})"
+            )
 
         if ktru_parts:
             parts.extend(["", "[ДАННЫЕ КТРУ]:"] + ktru_parts)
@@ -324,23 +330,7 @@ def run_analyze(
                 tender_info["points_count"] = detail.points_count
 
             if detail.has_full_time:
-                tender_info["has_full_time"] = True
-                tender_info["is_distance"] = False
-
-            for field in [
-                "teacher_days",
-                "accommodation_nights",
-                "transport_km",
-                "venue_rent_days",
-                "manikin_days",
-            ]:
-                val = getattr(detail, field, 0) or 0
-                if val > 0:
-                    tender_info[field] = val
-
-            if (detail.trip_days or 0) > 0:
-                tender_info["trip_days"] = detail.trip_days
-            tender_info["is_seasonal"] = bool(getattr(detail, "is_seasonal", False))
+                ...
             if (detail.opr_positions or 0) > 0:
                 tender_info["opr_positions"] = detail.opr_positions
             if (detail.opr_persons or 0) > 0:

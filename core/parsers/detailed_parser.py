@@ -222,7 +222,6 @@ class DetailedParser:
 
         region = self._extract_region(soup, law, lot_info)
         nmck_val = self._extract_nmck(soup)
-
         if law == "223-FZ" and lot_list_soup:
             ktru = KtruParser.parse_223_lot_list(lot_list_soup, nmck=nmck_val)
         else:
@@ -248,6 +247,14 @@ class DetailedParser:
         )
 
         guarantee_method = warranty["contract_method"] or "Не требуется"
+
+        # Qty + source из КТРУ (0/None не подставляем как «есть данные»)
+        rm_total = ktru.get("rm_total") or None
+        students_count = ktru.get("students_count") or None
+        points_count = ktru.get("points_count") or None
+        opr_positions = ktru.get("opr_positions") or None
+        # measurement_points = points для ПЛК
+        measurement_points = points_count
 
         return TenderDetail(
             tender_id=tender_id,
@@ -276,10 +283,21 @@ class DetailedParser:
             customer_name=self._extract_customer(soup),
             customer_region=region,
             platform_name=self._extract_etp(soup),
-            rm_total=ktru.get("rm_total", 0),
-            students_count=ktru.get("students_count", 0),
-            points_count=ktru.get("points_count", 0),
-            opr_positions=ktru.get("opr_positions", 0),
+            rm_total=rm_total,
+            students_count=students_count,
+            points_count=points_count,
+            measurement_points=measurement_points,
+            opr_positions=opr_positions,
+            rm_total_source=ktru.get("rm_total_source") if rm_total else None,
+            students_count_source=(
+                ktru.get("students_count_source") if students_count else None
+            ),
+            points_source=ktru.get("points_source") if points_count else None,
+            opr_positions_source=(
+                ktru.get("opr_positions_source") if opr_positions else None
+            ),
+            ktru_confidence=ktru.get("ktru_confidence") or None,
+            price_per_unit=ktru.get("price_per_unit"),
         )
 
     def _parse_documents(self, documents_html: str, law: str) -> List[Dict]:

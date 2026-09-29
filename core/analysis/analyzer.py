@@ -486,9 +486,12 @@ class TenderAnalyzer:
         PROTECTED = {
             "rm_total": "rm_total_source",
             "opr_positions": "opr_positions_source",
+            "opr_persons": "opr_positions_source",  # если используете
             "measurement_points": "points_source",
             "points_count": "points_source",
+            "students_count": "students_count_source",
         }
+        TRUSTED_SOURCES = ("ktru", "excel", "excel_nmck", "excel_table")
         nmck = float(tender_info.get("nmck") or 0)
 
         # === ЛОГ ОТВЕТА АГЕНТА (quantity + geo) ===
@@ -536,45 +539,16 @@ class TenderAnalyzer:
             if src_key:
                 src = str(tender_info.get(src_key) or "").lower()
                 old = tender_info.get(key)
-                if "excel" in src and old is not None and int(old or 0) > 0:
-                    old_i = int(old)
-                    try:
-                        new_i = int(value)
-                    except (TypeError, ValueError):
-                        new_i = 0
-
-                    # Excel «ядовит», если раздувает объём относительно НМЦК
-                    excel_bad = False
-                    if nmck > 0 and key == "rm_total" and old_i * 213 > nmck * 0.95:
-                        excel_bad = True
-                    if (
-                        nmck > 0
-                        and key in ("measurement_points", "points_count")
-                        and old_i * 50 > nmck
-                    ):
-                        excel_bad = True
-                    # агент ближе к nmck/1200, чем excel
-                    if (
-                        nmck > 0
-                        and key == "rm_total"
-                        and new_i > 0
-                        and abs(new_i - nmck / 1200) < abs(old_i - nmck / 1200) * 0.5
-                    ):
-                        excel_bad = True
-
-                    if not excel_bad:
+                if old is not None and int(old or 0) > 0:
+                    if any(t in src for t in TRUSTED_SOURCES):
                         logger.info(
-                            f"[{self.VERSION}] Excel защищён: {key}={old} "
+                            f"[{self.VERSION}] Qty защищён ({src}): {key}={old} "
                             f"(агент хотел {value})"
                         )
                         agent_logger.info(
-                            f"🛡️ EXCEL: {key} оставлен {old}, агент {value} отклонён"
+                            f"🛡️ QTY: {key}={old} source={src}, агент {value} отклонён"
                         )
                         continue
-                    logger.warning(
-                        f"[{self.VERSION}] Excel снят: {key} {old} → агент {value} "
-                        f"(excel нереалистичен к НМЦК)"
-                    )
 
             old_val = tender_info.get(key)
             tender_info[key] = value
@@ -781,48 +755,66 @@ class TenderAnalyzer:
             h in region for h in home_markers
         )
 
-        # === Sanity quantity vs НМЦК (агент не должен вернуть сброшенный КТРУ-мусор) ===
+        # === Sanity quantity vs НМЦК ===
         nmck = float(tender_info.get("nmck") or 0)
+
+        def _src(field_src: str) -> str:
+            return str(tender_info.get(field_src) or "").lower()
+
+        def _trusted(field_src: str) -> bool:
+            s = _src(field_src)
+            return any(t in s for t in ("ktru", "excel"))
+
         if nmck > 0:
-            # СОУТ: 1 РМ грубо не дешевле ~400–800 ₽ в НМЦК-логике
             rm = int(tender_info.get("rm_total") or 0)
             if tender_type in ("sout", "sout_opr") and rm > 0:
-                if rm * 800 > nmck * 1.05:  # как KTRU sanity
-                    logger.warning(
-                        f"[{self.VERSION}] Sanity после агента: rm_total={rm} "
-                        f"не лезет в НМЦК {nmck:,.0f} → сброс (будет Excel/fallback)"
-                    )
-                    agent_logger.warning(
-                        f"⚠️ Sanity: агент rm={rm} сброшен (НМЦК {nmck:,.0f})"
-                    )
-                    tender_info["rm_total"] = None
-                    tender_info.pop("rm_total_source", None)
-                    tender_info["needs_manual_review"] = True
+                unit = nmck / rm
+                if _trusted("rm_total_source"):
+                    if unit < 150:
+                        logger.warning(
+                            f"[{self.VERSION}] Низкая цена извещения ~{unit:.0f}₽/РМ "
+                            f"при qty={rm} (source={tender_info.get('rm_total_source')}). "
+                            f"Qty не трогаем; cost от costs_db (213₽/РМ)."
+                        )
+                        tender_info["needs_manual_review"] = True
+                        tender_info["low_nmck_unit_price"] = round(unit, 2)
+                else:
+                    if rm > 100_000 or (rm > 100 and unit < 20):
+                        logger.warning(
+                            f"[{self.VERSION}] Sanity: rm_total={rm} "
+                            f"без trusted source → сброс"
+                        )
+                        tender_info["rm_total"] = None
+                        tender_info.pop("rm_total_source", None)
 
-            # ОПР
             opr = int(tender_info.get("opr_positions") or 0)
-            if tender_type == "opr" and opr > 0 and opr * 300 > nmck * 1.05:
-                logger.warning(
-                    f"[{self.VERSION}] Sanity после агента: opr_positions={opr} → сброс"
-                )
-                tender_info["opr_positions"] = None
-                tender_info.pop("opr_positions_source", None)
-                tender_info["needs_manual_review"] = True
+            if (
+                tender_type == "opr"
+                and opr > 0
+                and not _trusted("opr_positions_source")
+            ):
+                if opr > 50_000 or (nmck / opr < 20 and opr > 50):
+                    logger.warning(
+                        f"[{self.VERSION}] Sanity: opr_positions={opr} "
+                        f"без trusted source → сброс"
+                    )
+                    tender_info["opr_positions"] = None
+                    tender_info.pop("opr_positions_source", None)
 
-            # ПЛК
             pts = int(
                 tender_info.get("measurement_points")
                 or tender_info.get("points_count")
                 or 0
             )
-            if tender_type == "plk" and pts > 0 and pts * 100 > nmck * 1.05:
-                logger.warning(
-                    f"[{self.VERSION}] Sanity после агента: points={pts} → сброс"
-                )
-                tender_info["measurement_points"] = None
-                tender_info["points_count"] = None
-                tender_info.pop("points_source", None)
-                tender_info["needs_manual_review"] = True
+            if tender_type == "plk" and pts > 0 and not _trusted("points_source"):
+                if pts > 100_000 or (nmck / pts < 5 and pts > 200):
+                    logger.warning(
+                        f"[{self.VERSION}] Sanity: points={pts} "
+                        f"без trusted source → сброс"
+                    )
+                    tender_info["measurement_points"] = None
+                    tender_info["points_count"] = None
+                    tender_info.pop("points_source", None)
 
         # === Safety-отказ агента ===
         raw_response = extracted.get("raw_response") if extracted else None

@@ -67,11 +67,20 @@ class TenderDetail:
     addresses_count: int = 1
     cities_count: int = 1
     regions_count: int = 1
-    rm_total: int = 0
-    students_count: int = 0
-    points_count: int = 0
-    opr_positions: int = 0
-    opr_persons: int = 0
+    rm_total: Optional[int] = None
+    students_count: Optional[int] = None
+    points_count: Optional[int] = None
+    measurement_points: Optional[int] = None
+    opr_positions: Optional[int] = None
+    opr_persons: Optional[int] = None
+
+    # Источник qty (ktru / excel / …) — для PROTECTED в analyzer
+    rm_total_source: Optional[str] = None
+    students_count_source: Optional[str] = None
+    points_source: Optional[str] = None
+    opr_positions_source: Optional[str] = None
+    ktru_confidence: Optional[float] = None
+    price_per_unit: Optional[float] = None  # цена из извещения, НЕ себестоимость
     # Флаги
     has_full_time: bool = False
     teacher_days: int = 0
