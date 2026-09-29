@@ -40,7 +40,7 @@ from core.search.parser import SearchResultParser, TenderSearchResult
 
 def _load_exclude_keywords() -> List[str]:
     """Загружает exclude_keywords (inline)."""
-    logger.info("[v6.3.1] Используем inline exclude_keywords")
+
     return [
         "лицензия МЧС",
         "медицинские работники",
@@ -221,8 +221,6 @@ class TenderSearcher:
         self._sessions = [self.session_manager.get_session(i) for i in range(3)]
         self._lock = Lock()
 
-        logger.info(f"🔍 TenderSearcher initialized ({len(self._sessions)} sessions)")
-
     def _get_session(self, index: int = 0) -> Any:
         if not self._sessions:
             return self.session
@@ -247,7 +245,6 @@ class TenderSearcher:
         logger.info(
             f"📋 Мин. дней до дедлайна: {self.config.get('min_days_to_deadline', 3)}"
         )
-        logger.info(f"📋 Сортировка: по дедлайну (ближайшие первые)")
         logger.info(f"{'='*60}")
 
         for result in self._search_single(max_pages):
@@ -392,14 +389,9 @@ class TenderSearcher:
     ) -> List[Dict]:
         """Поиск с сохранением результатов."""
         logger.info(f"\n{'='*60}")
-        logger.info(f" Фильтр НМЦК: ≥{self.config.get('min_nmck', 100000):,}₽")
-        logger.info(f"📋 Период: {self.config.get('publish_date_days', 3)} дней")
-        logger.info(f"📋 Законы: {self.config.get('laws', [])}")
-        logger.info(f"📋 ОКПД2: {self.config.get('okpd2_codes', [])}")
         logger.info(
             f"📋 Мин. дней до дедлайна: {self.config.get('min_days_to_deadline', 3)}"
         )
-        logger.info(f" Сортировка: по дедлайну (ближайшие первые)")
         logger.info(f"{'='*60}")
 
         results = []

@@ -120,56 +120,110 @@ class TenderAnalyzer:
 
         return tender_type, type_source, method
 
-    def _apply_excel_quantities(self, tender_info: dict, documents_text: str, tender_type: str) -> None:
-        """Парсит маркеры ExcelExtractor: === ИЗВЛЕЧЕНО ИЗ ТАБЛИЦЫ: Количество = N ==="""
+    def _apply_excel_quantities(
+        self, tender_info: dict, documents_text: str, tender_type: str
+    ) -> None:
+        """Парсит маркеры ExcelExtractor. Для СОУТ не берём слепой max/сумму НМЦК."""
         if not documents_text:
             return
-        found = [int(x) for x in re.findall(
-            r"=== ИЗВЛЕЧЕНО ИЗ ТАБЛИЦЫ:\s*Количество\s*=\s*(\d+)",
-            documents_text,
-            flags=re.IGNORECASE,
-        )]
+        found = [
+            int(x)
+            for x in re.findall(
+                r"=== ИЗВЛЕЧЕНО ИЗ ТАБЛИЦЫ:\s*Количество\s*=\s*(\d+)",
+                documents_text,
+                flags=re.IGNORECASE,
+            )
+        ]
         if not found:
-            # запасной паттерн из enriched rows
-            found = [int(x) for x in re.findall(
-                r"Количество\s*=\s*(\d{1,5})",
-                documents_text[:8000],
-            )]
-        if not found:
-            return
-
-        # Берём разумное значение: для НМЦК часто одна строка (114), не сумма мусора
-        qty = max(found)
-        # отсекаем явный мусор
-        if qty < 1 or qty > 50000:
-            return
-
-        if tender_type == "opr" and not tender_info.get("opr_positions"):
-            tender_info["opr_positions"] = qty
-            tender_info["opr_positions_source"] = "excel_nmck"
-            logger.info(f"[{self.VERSION}] Excel→opr_positions={qty}")
-
-        elif tender_type in ("sout", "sout_opr") and not tender_info.get("rm_total"):
-            # для СОУТ предпочитаем значение ближе к НМЦК/800..2500
-            nmck = float(tender_info.get("nmck") or 0)
-            candidates = found
-            if nmck > 0:
-                scored = sorted(
-                    candidates,
-                    key=lambda q: abs(nmck / q - 1200) if q else 1e18,
+            found = [
+                int(x)
+                for x in re.findall(
+                    r"Количество\s*=\s*(\d{1,5})",
+                    documents_text[:8000],
                 )
-                qty = scored[0]
+            ]
+        if not found:
+            return
+
+        nmck = float(tender_info.get("nmck") or 0)
+
+        def pick_near_target(candidates: list, target: float, lo: int, hi: int) -> int | None:
+            pool = [q for q in candidates if lo <= q <= hi]
+            if not pool:
+                pool = [q for q in candidates if q >= 1]
+            if not pool:
+                return None
+            if target > 0 and len(pool) > 1:
+                return min(pool, key=lambda q: abs(q - target))
+            return max(pool)
+
+        # --- OPR ---
+        if tender_type == "opr" and not tender_info.get("opr_positions"):
+            target = (nmck / 800.0) if nmck > 0 else 0
+            qty = pick_near_target(found, target, 2, 2000)
+            if qty:
+                tender_info["opr_positions"] = qty
+                tender_info["opr_positions_source"] = "excel_nmck"
+                logger.info(f"[{self.VERSION}] Excel→opr_positions={qty}")
+
+        if tender_type == "opr":
+            if tender_info.get("opr_positions") and not tender_info.get("opr_persons"):
+                tender_info["opr_persons"] = tender_info["opr_positions"]
+            if tender_info.get("opr_persons") and not tender_info.get("opr_positions"):
+                tender_info["opr_positions"] = tender_info["opr_persons"]
+            return
+
+        # --- PLK ---
+        if tender_type == "plk" and not (
+            tender_info.get("measurement_points") or tender_info.get("points_count")
+        ):
+            target = (nmck / 400.0) if nmck > 0 else 0
+            qty = pick_near_target(found, target, 1, 5000)
+            if qty:
+                # sanity: слишком много точек относительно НМЦК
+                if nmck > 0 and qty * 50 > nmck:
+                    logger.warning(
+                        f"[{self.VERSION}] Excel PLK qty={qty} отвергнут "
+                        f"(нереалистично к НМЦК {nmck:,.0f})"
+                    )
+                else:
+                    tender_info["measurement_points"] = qty
+                    tender_info["points_count"] = qty
+                    tender_info["points_source"] = "excel_nmck"
+                    logger.info(f"[{self.VERSION}] Excel→measurement_points={qty}")
+            return
+
+        # --- SOUT ---
+        if tender_type in ("sout", "sout_opr") and not tender_info.get("rm_total"):
+            # цель: рыночный ориентир ~800–1500 ₽/РМ в НМЦК
+            target = (nmck / 1200.0) if nmck > 0 else 0
+            candidates = [q for q in found if 1 <= q <= 5000]
+            if not candidates:
+                return
+            qty = pick_near_target(candidates, target, 1, 3000)
+            if not qty:
+                return
+
+            # отсев суммы строк обоснования (кейс 1740 при НМЦК ~200k)
+            if nmck > 0:
+                # грубо: 213 ₽/РМ себест. → qty не должен давать cost ≫ НМЦК
+                if qty * 213 > nmck * 0.95:
+                    logger.warning(
+                        f"[{self.VERSION}] Excel SOUT qty={qty} отвергнут "
+                        f"(qty×213 > 0.95×НМЦК {nmck:,.0f}); ждут агент/КТРУ"
+                    )
+                    return
+                # слишком далеко от оценки по НМЦК (сумма мусора)
+                if target >= 5 and qty > max(target * 3, target + 150):
+                    logger.warning(
+                        f"[{self.VERSION}] Excel SOUT qty={qty} отвергнут "
+                        f"(далеко от target≈{target:.0f})"
+                    )
+                    return
+
             tender_info["rm_total"] = qty
             tender_info["rm_total_source"] = "excel_nmck"
             logger.info(f"[{self.VERSION}] Excel→rm_total={qty}")
-
-        elif tender_type == "plk" and not (
-            tender_info.get("measurement_points") or tender_info.get("points_count")
-        ):
-            tender_info["measurement_points"] = qty
-            tender_info["points_count"] = qty
-            tender_info["points_source"] = "excel_nmck"
-            logger.info(f"[{self.VERSION}] Excel→measurement_points={qty}")
 
     def analyze(
         self,
@@ -228,44 +282,7 @@ class TenderAnalyzer:
 
             self._apply_excel_quantities(tender_info, documents_text, tender_type)
             self.fallback_service.apply(tender_info, tender_type)
-
-            nmck = tender_info.get("nmck", 0)
-            if nmck > 0:
-                if tender_type in ("sout", "sout_opr") and not tender_info.get(
-                    "rm_total"
-                ):
-                    estimated = int(nmck / 1200)
-                    tender_info["rm_total"] = estimated
-                    tender_info["rm_total_source"] = "fallback_nmck"
-                    agent_logger.info(f"📉 FALLBACK СОУТ: {estimated} РМ (из НМЦК)")
-                elif (
-                    tender_type == "plk"
-                    and not tender_info.get("measurement_points")
-                    and not tender_info.get("points_count")
-                ):
-                    estimated = int(nmck / 500)
-                    tender_info["measurement_points"] = estimated
-                    tender_info["points_count"] = estimated
-                    tender_info["points_source"] = "fallback_nmck"
-                    agent_logger.info(f"📉 FALLBACK ПЛК: {estimated} точек (из НМЦК)")
-                elif (
-                    tender_type == "opr"
-                    and not tender_info.get("opr_positions")
-                    and not tender_info.get("opr_persons")
-                ):
-                    estimated = int(nmck / 700)
-                    tender_info["opr_positions"] = estimated
-                    tender_info["opr_positions_source"] = "fallback_nmck"
-                    agent_logger.info(f"📉 FALLBACK ОПР: {estimated} позиций (из НМЦК)")
-                elif tender_type == "education" and not tender_info.get(
-                    "students_count"
-                ):
-                    estimated = int(nmck / 1500)
-                    tender_info["students_count"] = estimated
-                    tender_info["students_count_source"] = "fallback_nmck"
-                    agent_logger.info(
-                        f"📉 FALLBACK ОБУЧЕНИЕ: {estimated} слушателей (из НМЦК)"
-                    )
+            # Всё qty-estimate только через FallbackService (cap + manual_review)
 
         # Шаг 4: Глобальные затраты
         nmck = tender_info.get("nmck", 0)
@@ -446,6 +463,22 @@ class TenderAnalyzer:
             agent_logger.warning(f"⚠️ АГЕНТ НЕ ВЕРНУЛ ДАННЫЕ ДЛЯ {tender_id}")
             return
 
+        # Жёсткий отказ агента по decision
+        dec = str(extracted.get("decision") or "").lower().replace("ё", "е")
+        if "не рекоменд" in dec or dec in ("reject", "blocked", "нерекомендуется"):
+            reason = (
+                extracted.get("reason")
+                or extracted.get("agent_block_reason")
+                or "Агент: не рекомендуется"
+            )
+            logger.warning(
+                f"[{self.VERSION}] Агент decision=не рекомендуется — {reason}"
+            )
+            agent_logger.warning(f"🚫 АГЕНТ REJECT: {reason}")
+            tender_info["agent_blocked"] = True
+            tender_info["agent_block_reason"] = reason
+            tender_info["needs_manual_review"] = True
+            return
         agent_logger.info(f"🔄 СРАВНЕНИЕ ДАННЫХ ПАРСЕРА И АГЕНТА ДЛЯ {tender_id}:")
         pre_agent_students = int(tender_info.get("students_count") or 0)
 
@@ -456,11 +489,47 @@ class TenderAnalyzer:
             "measurement_points": "points_source",
             "points_count": "points_source",
         }
+        nmck = float(tender_info.get("nmck") or 0)
+
+        # === ЛОГ ОТВЕТА АГЕНТА (quantity + geo) ===
+        agent_logger.info(
+            f"📦 АГЕНТ RAW GEO/QTY {tender_id}: "
+            f"rm_total={extracted.get('rm_total')!r} | "
+            f"opr_positions={extracted.get('opr_positions')!r} | "
+            f"points={extracted.get('measurement_points') or extracted.get('points_count')!r} | "
+            f"students={extracted.get('students_count')!r} | "
+            f"addresses_count={extracted.get('addresses_count')!r} | "
+            f"cities_count={extracted.get('cities_count')!r} | "
+            f"regions_count={extracted.get('regions_count')!r} | "
+            f"addresses={extracted.get('addresses')!r} | "
+            f"cities={extracted.get('cities')!r}"
+        )
+        logger.info(
+            f"[{self.VERSION}] Агент geo/qty: "
+            f"addr={extracted.get('addresses_count')} "
+            f"cities={extracted.get('cities_count')} "
+            f"regions={extracted.get('regions_count')} "
+            f"list_addr={extracted.get('addresses')} "
+            f"list_cities={extracted.get('cities')}"
+        )
+
+        # null по quantity — явно в лог (MCP сам не вызовется)
+        for qk in (
+            "rm_total",
+            "opr_positions",
+            "measurement_points",
+            "points_count",
+            "students_count",
+            "addresses_count",
+        ):
+            if qk in extracted and extracted.get(qk) is None:
+                logger.warning(
+                    f"[{self.VERSION}] Агент вернул {qk}=null — будет Excel/fallback, не MCP"
+                )
+                agent_logger.warning(f"⚠️ NULL от агента: {qk}")
 
         for key, value in extracted.items():
-            if value is None:
-                continue
-            if key.startswith("_"):
+            if value is None or key.startswith("_"):
                 continue
 
             src_key = PROTECTED.get(key)
@@ -468,14 +537,44 @@ class TenderAnalyzer:
                 src = str(tender_info.get(src_key) or "").lower()
                 old = tender_info.get(key)
                 if "excel" in src and old is not None and int(old or 0) > 0:
-                    logger.info(
-                        f"[{self.VERSION}] Excel защищён: {key}={old} "
-                        f"(агент хотел {value}, source={tender_info.get(src_key)})"
+                    old_i = int(old)
+                    try:
+                        new_i = int(value)
+                    except (TypeError, ValueError):
+                        new_i = 0
+
+                    # Excel «ядовит», если раздувает объём относительно НМЦК
+                    excel_bad = False
+                    if nmck > 0 and key == "rm_total" and old_i * 213 > nmck * 0.95:
+                        excel_bad = True
+                    if (
+                        nmck > 0
+                        and key in ("measurement_points", "points_count")
+                        and old_i * 50 > nmck
+                    ):
+                        excel_bad = True
+                    # агент ближе к nmck/1200, чем excel
+                    if (
+                        nmck > 0
+                        and key == "rm_total"
+                        and new_i > 0
+                        and abs(new_i - nmck / 1200) < abs(old_i - nmck / 1200) * 0.5
+                    ):
+                        excel_bad = True
+
+                    if not excel_bad:
+                        logger.info(
+                            f"[{self.VERSION}] Excel защищён: {key}={old} "
+                            f"(агент хотел {value})"
+                        )
+                        agent_logger.info(
+                            f"🛡️ EXCEL: {key} оставлен {old}, агент {value} отклонён"
+                        )
+                        continue
+                    logger.warning(
+                        f"[{self.VERSION}] Excel снят: {key} {old} → агент {value} "
+                        f"(excel нереалистичен к НМЦК)"
                     )
-                    agent_logger.info(
-                        f"🛡️ EXCEL: {key} оставлен {old}, агент {value} отклонён"
-                    )
-                    continue
 
             old_val = tender_info.get(key)
             tender_info[key] = value
@@ -612,6 +711,22 @@ class TenderAnalyzer:
         p_cities = int(parser_geo.get("cities_count") or 0)
         p_regions = int(parser_geo.get("regions_count") or 1)
         p_reliable = bool(parser_geo.get("is_reliable"))
+        p_city_list = parser_geo.get("cities") or parser_geo.get("city_list") or []
+        p_addr_list = (
+            parser_geo.get("addresses") or parser_geo.get("address_list") or []
+        )
+
+        logger.info(
+            f"[{self.VERSION}] GEO сравнение {tender_id}: "
+            f"агент addr={agent_addr} cities={agent_cities} regions={tender_info.get('regions_count')} | "
+            f"parser cities={p_cities} regions={p_regions} reliable={p_reliable} | "
+            f"parser_cities={p_city_list} parser_addresses={p_addr_list}"
+        )
+        agent_logger.info(
+            f"📍 GEO: агент a={agent_addr} c={agent_cities} | "
+            f"parser c={p_cities} r={p_regions} reliable={p_reliable} | "
+            f"города парсера: {p_city_list}"
+        )
 
         # 1) Агент дал 1, парсер надёжно нашёл больше → берём парсер
         if agent_addr <= 1 and agent_cities <= 1 and p_reliable and p_cities > 1:
@@ -620,9 +735,10 @@ class TenderAnalyzer:
             tender_info["regions_count"] = max(1, p_regions)
             logger.warning(
                 f"[{self.VERSION}] Гео: агент=1, берём AddressParser "
-                f"({p_cities} городов, {p_regions} регионов)"
+                f"({p_cities} городов, {p_regions} регионов) → {p_city_list}"
             )
-        # 2) Агент дал много (>=3), парсер 0–1 → ОСТАВЛЯЕМ агента (кейс Красноярский край)
+            agent_logger.warning(f"📍 Переопределение geo парсером: {p_city_list}")
+        # 2) Агент дал много (>=3), парсер 0–1 → оставляем агента
         elif max(agent_addr, agent_cities) >= 3 and p_cities <= 1:
             logger.info(
                 f"[{self.VERSION}] Гео: агент={max(agent_addr, agent_cities)}, "
@@ -634,21 +750,79 @@ class TenderAnalyzer:
             int(tender_info.get("addresses_count") or 1),
         )
         regions = int(tender_info.get("regions_count") or 1)
-        if regions <= 1:
-            capped = min(cities, 3)
-        else:
-            capped = min(cities, 4)
+        capped = min(cities, 3) if regions <= 1 else min(cities, 4)
         if cities > capped:
             logger.warning(
                 f"[{self.VERSION}] Гео-кап: {cities} → {capped} (regions={regions})"
             )
+            agent_logger.warning(f"📍 Гео-кап: {cities} → {capped}")
             tender_info["cities_count"] = capped
             tender_info["addresses_count"] = capped
 
-        # Удалённый регион для транспорта (дом — Свердловская / Екб)
-        region = (tender_info.get("region") or tender_info.get("customer_region") or "").lower()
+        # Итог geo после всех правил
+        logger.info(
+            f"[{self.VERSION}] GEO ИТОГ {tender_id}: "
+            f"addresses={tender_info.get('addresses_count')} "
+            f"cities={tender_info.get('cities_count')} "
+            f"regions={tender_info.get('regions_count')} "
+            f"remote={tender_info.get('is_remote_region')}"
+        )
+        agent_logger.info(
+            f"📍 GEO ИТОГ: a={tender_info.get('addresses_count')} "
+            f"c={tender_info.get('cities_count')} "
+            f"r={tender_info.get('regions_count')}"
+        )
+
+        region = (
+            tender_info.get("region") or tender_info.get("customer_region") or ""
+        ).lower()
         home_markers = ("свердлов", "екатеринбург", "екат")
-        tender_info["is_remote_region"] = bool(region) and not any(h in region for h in home_markers)
+        tender_info["is_remote_region"] = bool(region) and not any(
+            h in region for h in home_markers
+        )
+
+        # === Sanity quantity vs НМЦК (агент не должен вернуть сброшенный КТРУ-мусор) ===
+        nmck = float(tender_info.get("nmck") or 0)
+        if nmck > 0:
+            # СОУТ: 1 РМ грубо не дешевле ~400–800 ₽ в НМЦК-логике
+            rm = int(tender_info.get("rm_total") or 0)
+            if tender_type in ("sout", "sout_opr") and rm > 0:
+                if rm * 800 > nmck * 1.05:  # как KTRU sanity
+                    logger.warning(
+                        f"[{self.VERSION}] Sanity после агента: rm_total={rm} "
+                        f"не лезет в НМЦК {nmck:,.0f} → сброс (будет Excel/fallback)"
+                    )
+                    agent_logger.warning(
+                        f"⚠️ Sanity: агент rm={rm} сброшен (НМЦК {nmck:,.0f})"
+                    )
+                    tender_info["rm_total"] = None
+                    tender_info.pop("rm_total_source", None)
+                    tender_info["needs_manual_review"] = True
+
+            # ОПР
+            opr = int(tender_info.get("opr_positions") or 0)
+            if tender_type == "opr" and opr > 0 and opr * 300 > nmck * 1.05:
+                logger.warning(
+                    f"[{self.VERSION}] Sanity после агента: opr_positions={opr} → сброс"
+                )
+                tender_info["opr_positions"] = None
+                tender_info.pop("opr_positions_source", None)
+                tender_info["needs_manual_review"] = True
+
+            # ПЛК
+            pts = int(
+                tender_info.get("measurement_points")
+                or tender_info.get("points_count")
+                or 0
+            )
+            if tender_type == "plk" and pts > 0 and pts * 100 > nmck * 1.05:
+                logger.warning(
+                    f"[{self.VERSION}] Sanity после агента: points={pts} → сброс"
+                )
+                tender_info["measurement_points"] = None
+                tender_info["points_count"] = None
+                tender_info.pop("points_source", None)
+                tender_info["needs_manual_review"] = True
 
         # === Safety-отказ агента ===
         raw_response = extracted.get("raw_response") if extracted else None

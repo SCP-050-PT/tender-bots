@@ -314,14 +314,11 @@ class GoogleSheetsManager:
             if not ok:
                 logger.error(f"❌ {msg}")
                 raise ValueError(msg)
-            logger.info("✅ Credentials валидны")
+            logger.info("✅ Credentials валидны и загружены")
 
             creds_path = Path(self.credentials_path)
             credentials = Credentials.from_service_account_file(
                 str(creds_path), scopes=self.SCOPES
-            )
-            logger.info(
-                f"✅ Credentials загружены: {credentials.service_account_email}"
             )
 
             self.client = gspread.authorize(credentials)

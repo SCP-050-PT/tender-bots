@@ -151,7 +151,8 @@ class GuardEngine:
 
         # 1. Проверка строгих триггеров
         for kw in STRICT_FORBIDDEN:
-            if kw in purchase_name or kw in documents_text_lower:
+            hay = purchase_name if tender_type == "education" else (purchase_name + " " + documents_text_lower)
+            if kw in hay:
                 is_forbidden = True
                 forbidden_kw_found = kw
                 break
@@ -193,10 +194,12 @@ class GuardEngine:
                 )
                 break
 
-        # === Guard: зона аккредитации (cannot_measure) ===
-        # Срабатывает по title + началу текста ТЗ
+                # === Guard: зона аккредитации — только лабораторные/СОУТ/ОПР ===
+        ACCREDITATION_TYPES = {"plk", "sout", "opr", "sout_opr", "combined", "testing"}
+        if tender_type not in ACCREDITATION_TYPES:
+            return info, guards
+
         ACCREDITATION_BLOCK = [
-            # Ионизирующие излучения
             ("рентген", "Ионизирующие излучения (рентген) — вне аккредитации"),
             ("ионизирующ", "Ионизирующие излучения — вне аккредитации"),
             ("гамма-излучен", "Ионизирующие излучения (γ) — вне аккредитации"),
@@ -204,13 +207,11 @@ class GuardEngine:
             ("радиационн", "Радиационный контроль — вне аккредитации"),
             ("амбиентн", "Дозиметрия / амбиентный эквивалент — вне аккредитации"),
             ("нейтронн", "Нейтронное излучение — вне аккредитации"),
-            # Микробиология / вода
             ("смыв", "Микробиология (смывы) — вне аккредитации"),
             ("бактериологич", "Микробиология — вне аккредитации"),
-            ("гельминт", "Паразитология — вне аккредитации"),
+            ("гельминт", "Паразиология — вне аккредитации"),
             ("питьев", "Анализ воды — вне аккредитации"),
             ("сточн", "Анализ сточных вод — вне аккредитации"),
-            # Прочее
             ("асбест", "Асбест — вне аккредитации"),
             ("пестицид", "Пестициды — вне аккредитации"),
             ("диоксин", "Диоксины — вне аккредитации"),
@@ -219,16 +220,19 @@ class GuardEngine:
         check_text = (purchase_name + " " + documents_text_lower)[:4000]
 
         for kw, reason in ACCREDITATION_BLOCK:
-            if kw in check_text:
-                # Исключение: СОУТ может упоминать "радиационн" в общем списке факторов,
-                # но если это основной предмет закупки (title) — стоп
-                if kw in ("радиационн",) and tender_type == "sout" and kw not in purchase_name:
-                    continue
-                guards.append(f"Аккредитация: {reason}")
-                logger.warning(f"[{self.VERSION}] GUARD АККРЕДИТАЦИЯ: {reason}")
-                info["_forbidden_direction"] = True
-                info["agent_blocked"] = True
-                info["agent_block_reason"] = reason
-                info["review_reason"] = reason
-                break
+            if kw not in check_text:
+                continue
+            if kw == "радиационн" and tender_type == "sout" and kw not in purchase_name:
+                continue
+            # «вредных факторов» в обучении ОТ ≠ анализ воды
+            if tender_type == "education":
+                continue
+            guards.append(f"Аккредитация: {reason}")
+            logger.warning(f"[{self.VERSION}] GUARD АККРЕДИТАЦИЯ: {reason}")
+            info["_forbidden_direction"] = True
+            info["agent_blocked"] = True
+            info["agent_block_reason"] = reason
+            info["review_reason"] = reason
+            break
+
         return info, guards

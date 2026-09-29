@@ -112,7 +112,19 @@ class AddressParser:
         "кбк",
         "ктру",
         "окейд",
+        "представлен",
+        "документ",
+        "счет",
+        "счёт",
+        "приказ",
+        "раздел",
+        "пункт",
+        "приложение",
+        "номер",
+        "дата",
+        "форм",
     )
+    MIN_CITY_LEN = 3
 
     CITY_PATTERNS = [
         r"г\.?\s*([А-Яа-яЁё\-]+(?:\s+[А-Яа-яЁё\-]+){0,2})",
@@ -186,6 +198,11 @@ class AddressParser:
 
             found_city_clean = found_city.strip(".,;: ")
             found_city_lower = found_city_clean.lower()
+            if len(found_city_clean) < self.MIN_CITY_LEN:
+                continue
+            # односимвольные / 2 буквы без whitelist
+            if len(found_city_lower) <= 2 and found_city_lower not in known_cities_lower:
+                continue
 
             words_in_city = set(re.findall(r"\w+", found_city_lower))
             if words_in_city.intersection(self.ADMIN_WORDS):
@@ -202,11 +219,14 @@ class AddressParser:
             is_known = found_city_lower in known_cities_lower
             # допускаем «г. X» из 1–2 слов, если нет мусора
             is_plausible = (
-                len(found_city_clean.split()) <= 2
-                and found_city_clean[0].isupper()
-                and not any(c.isdigit() for c in found_city_clean)
+                is_known
+                or (
+                    len(found_city_clean.split()) <= 2
+                    and len(found_city_clean) >= 4
+                    and found_city_clean[0].isupper()
+                    and not any(c.isdigit() for c in found_city_clean)
+                )
             )
-
             if not is_known and not is_plausible:
                 continue
 

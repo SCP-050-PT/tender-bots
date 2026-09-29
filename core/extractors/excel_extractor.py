@@ -235,7 +235,18 @@ class ExcelExtractor(BaseExtractor):
             final_quantities.append(total_quantity)
             logger.info(f"[ExcelExtractor] Использовано ИТОГО: {total_quantity}")
         elif sum_of_rows > 0:
-            final_quantities.append(sum_of_rows)
+            # Для обоснования НМЦК сумма «кол-во» по строкам часто = мусор
+            # (цены/позиции), а не число РМ. Не ставим sum первым.
+            if is_nmck_file:
+                logger.info(
+                    f"[ExcelExtractor] НМЦК-файл: СУММА строк={sum_of_rows} "
+                    f"не используется как главное количество"
+                )
+            else:
+                final_quantities.append(sum_of_rows)
+                logger.info(
+                    f"[ExcelExtractor] Использована СУММА строк: {sum_of_rows}"
+                )
             logger.info(f"[ExcelExtractor] Использована СУММА строк: {sum_of_rows}")
 
         for q in extracted_quantities:
@@ -389,7 +400,18 @@ class ExcelExtractor(BaseExtractor):
             final_quantities.append(total_quantity)
             logger.info(f"[ExcelExtractor] Использовано ИТОГО: {total_quantity}")
         elif sum_of_rows > 0:
-            final_quantities.append(sum_of_rows)
+            # Для обоснования НМЦК сумма «кол-во» по строкам часто = мусор
+            # (цены/позиции), а не число РМ. Не ставим sum первым.
+            if is_nmck_file:
+                logger.info(
+                    f"[ExcelExtractor] НМЦК-файл: СУММА строк={sum_of_rows} "
+                    f"не используется как главное количество"
+                )
+            else:
+                final_quantities.append(sum_of_rows)
+                logger.info(
+                    f"[ExcelExtractor] Использована СУММА строк: {sum_of_rows}"
+                )
             logger.info(f"[ExcelExtractor] Использована СУММА строк: {sum_of_rows}")
 
         for q in extracted_quantities:

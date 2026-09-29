@@ -180,8 +180,6 @@ def run_analyze(
     duplicates_skipped = 0
     added_to_sheets_count = 0
     errors_count = 0
-
-    logger.info(" Прогрев сессий... Ждем 5 секунд перед первым запросом")
     time.sleep(5)
 
     for tender in searcher.search(max_pages=max_pages, max_results=None):

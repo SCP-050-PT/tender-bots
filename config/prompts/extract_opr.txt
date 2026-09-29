@@ -1,9 +1,19 @@
 [TYPE_HINT: opr]
 === EXTRACT_OPR ===
-- opr_positions: должности/позиции из таблицы ТЗ. Нет числа → null (не выдумывать).
-- opr_persons: работники или null.
-- risk_level: low|medium|high (по умолчанию medium).
-- addresses_count, cities_count: только явный список объектов; нет → 1.
+ЗАДАЧА: Извлеки параметры для расчёта ОПР (оценка профессиональных рисков) с географией.
 
-JSON:
-{"type":"opr","opr_positions":число|null,"opr_persons":число|null,"risk_level":"low|medium|high","addresses_count":число,"cities_count":число,"confidence":0.0-1.0,"is_estimated":true|false}
+ПРИОРИТЕТ КОЛИЧЕСТВА (opr_positions):
+1. Явные фразы: «N должностей», «N рабочих мест», «N позиций», «N карт рисков», «количество = N» в таблице НМЦК/ТЗ.
+2. Сумма по столбцу «Кол-во» / «Количество» в таблицах обоснования НМЦК.
+3. Если в тексте есть маркер парсера «=== ИЗВЛЕЧЕНО ИЗ ТАБЛИЦЫ: Количество = N ===» — используй N.
+4. НЕ путай с ценой, НМЦК, процентами, номерами пунктов (1.2.3).
+5. Диапазон здравого смысла: обычно 5–800 должностей. Если видишь 1 при НМЦК > 100 тыс. — ищи другое число в таблице.
+6. Если точного числа нет — поставь null (fallback посчитает по НМЦК), НЕ error.
+
+Также:
+- opr_persons: работники; если нет — = opr_positions или null
+- addresses_count / cities_count: по списку объектов/филиалов в ТЗ (не 1 по умолчанию при нескольких адресах)
+- regions_count
+
+Верни JSON:
+{"type":"opr","opr_positions":число|null,"opr_persons":число|null,"risk_level":"low|medium|high","addresses_count":число,"cities_count":число,"regions_count":число,"confidence":0.0-1.0}
