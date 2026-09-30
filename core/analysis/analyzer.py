@@ -702,7 +702,17 @@ class TenderAnalyzer:
             f"города парсера: {p_city_list}"
         )
 
-        # 1) Агент дал 1, парсер надёжно нашёл больше → берём парсер
+        # Есть ли у агента реальные списки (не голые цифры)
+        agent_city_list = extracted.get("cities") or extracted.get("city_list") or []
+        agent_addr_list = (
+            extracted.get("addresses") or extracted.get("address_list") or []
+        )
+        agent_has_list = bool(
+            (isinstance(agent_city_list, list) and len(agent_city_list) > 0)
+            or (isinstance(agent_addr_list, list) and len(agent_addr_list) > 0)
+        )
+
+        # 1) Агент = 1, парсер надёжно больше → парсер
         if agent_addr <= 1 and agent_cities <= 1 and p_reliable and p_cities > 1:
             tender_info["addresses_count"] = p_cities
             tender_info["cities_count"] = p_cities
@@ -712,11 +722,39 @@ class TenderAnalyzer:
                 f"({p_cities} городов, {p_regions} регионов) → {p_city_list}"
             )
             agent_logger.warning(f"📍 Переопределение geo парсером: {p_city_list}")
-        # 2) Агент дал много (>=3), парсер 0–1 → оставляем агента
-        elif max(agent_addr, agent_cities) >= 3 and p_cities <= 1:
+
+        # 2a) Парсер reliable, агент раздул без списка → не выше парсера
+        elif (
+            p_reliable
+            and p_cities >= 1
+            and max(agent_addr, agent_cities) > p_cities
+            and not agent_has_list
+        ):
+            tender_info["cities_count"] = p_cities
+            tender_info["addresses_count"] = max(
+                p_cities, min(int(agent_addr or p_cities), p_cities + 1)
+            )
+            tender_info["regions_count"] = max(
+                1, int(tender_info.get("regions_count") or p_regions)
+            )
+            logger.info(
+                f"[{self.VERSION}] GEO: parser reliable c={p_cities}, "
+                f"агент {max(agent_addr, agent_cities)} без списка → cap к парсеру"
+            )
+            agent_logger.info(f"📍 GEO cap→parser: cities={p_cities} (агент без list)")
+
+        # 2b) Агент много, парсер 0–1 и НЕ reliable → можно оставить агента
+        elif max(agent_addr, agent_cities) >= 3 and p_cities <= 1 and not p_reliable:
             logger.info(
                 f"[{self.VERSION}] Гео: агент={max(agent_addr, agent_cities)}, "
-                f"parser={p_cities} — оставляем агента"
+                f"parser={p_cities} unreliable — оставляем агента"
+            )
+
+        # 2c) Агент много + есть список → агент (кап ниже)
+        elif max(agent_addr, agent_cities) >= 3 and agent_has_list:
+            logger.info(
+                f"[{self.VERSION}] Гео: агент со списком "
+                f"cities={agent_city_list or agent_addr_list}"
             )
         # 3) Кап
         cities = max(
