@@ -173,24 +173,100 @@ class TenderAnalyzer:
                 tender_info["opr_positions"] = tender_info["opr_persons"]
             return
 
-        # --- PLK ---
+            # --- PLK ---
         if tender_type == "plk" and not (
             tender_info.get("measurement_points") or tender_info.get("points_count")
         ):
-            target = (nmck / 400.0) if nmck > 0 else 0
-            qty = pick_near_target(found, target, 1, 5000)
-            if qty:
-                # sanity: слишком много точек относительно НМЦК
-                if nmck > 0 and qty * 50 > nmck:
+            nmck = float(tender_info.get("nmck") or 0)
+            qty = None
+            src = None
+
+            # 1) Маркеры ExcelExtractor (как раньше)
+            if found:
+                target = (nmck / 400.0) if nmck > 0 else 0
+                qty = pick_near_target(found, target, 1, 5000)
+                if qty and nmck > 0 and qty * 50 > nmck:
                     logger.warning(
                         f"[{self.VERSION}] Excel PLK qty={qty} отвергнут "
                         f"(нереалистично к НМЦК {nmck:,.0f})"
                     )
-                else:
-                    tender_info["measurement_points"] = qty
-                    tender_info["points_count"] = qty
-                    tender_info["points_source"] = "excel_nmck"
-                    logger.info(f"[{self.VERSION}] Excel→measurement_points={qty}")
+                    qty = None
+                elif qty:
+                    src = "excel_nmck"
+
+            # 2) Сумма «(N замер/а/ов)» из программы ПЛК — типичный ООЗ
+            if not qty:
+                text_l = (documents_text or "")[:50000]
+                # (5 замеров), (3 замера), (1 замер), 1замер
+                zamer_re = re.compile(
+                    r"[\(\s](\d{1,4})\s*замер[аов]?\b",
+                    re.IGNORECASE,
+                )
+                zamer_vals = [int(m.group(1)) for m in zamer_re.finditer(text_l)]
+                zamer_vals = [v for v in zamer_vals if 1 <= v <= 200]
+                if zamer_vals:
+                    s = sum(zamer_vals)
+                    # sanity: не раздувать сверх разумного к НМЦК
+                    if nmck > 0 and s * 30 > nmck * 2:
+                        logger.warning(
+                            f"[{self.VERSION}] PLK sum(замер)={s} "
+                            f"({len(zamer_vals)} шт) подозрительно vs НМЦК — skip"
+                        )
+                    elif 5 <= s <= 5000:
+                        qty = s
+                        src = "text_zamer_sum"
+                        logger.info(
+                            f"[{self.VERSION}] Text→measurement_points={qty} "
+                            f"(sum {len(zamer_vals)}×замер, "
+                            f"sample={zamer_vals[:12]})"
+                        )
+
+            # 3) Старые «точек» / Excel — как запас
+            if not qty:
+                text_l = (documents_text or "")[:40000]
+                patterns = [
+                    r"(?:всего|итого|количество)[^\d]{0,40}?(\d{1,5})\s*(?:точек|точки|точка)\b",
+                    r"(\d{1,5})\s*(?:точек|точки)\s*(?:замеров|измерений|контроля)?",
+                    r"(?:замеров|измерений|точек\s+контроля)[^\d]{0,30}?(\d{1,5})",
+                    r"на\s+(\d{1,5})\s*(?:точках|рабочих\s+местах)?",
+                    r"(\d{1,5})\s*точк[аиеух]",
+                ]
+                cands: list[int] = []
+                for pat in patterns:
+                    for m in re.finditer(pat, text_l, flags=re.IGNORECASE):
+                        try:
+                            v = int(m.group(1))
+                        except (IndexError, ValueError):
+                            continue
+                        if 1 <= v <= 5000:
+                            cands.append(v)
+                if cands:
+                    target = (nmck / 400.0) if nmck > 0 else 0
+                    # предпочитаем ближе к НМЦК/400, отсекаем мусор 1–2
+                    pool = [c for c in cands if c >= 5] or cands
+                    if target > 0 and len(pool) > 1:
+                        qty = min(pool, key=lambda q: abs(q - target))
+                    else:
+                        qty = max(pool)
+                    if nmck > 0 and qty * 50 > nmck:
+                        logger.warning(
+                            f"[{self.VERSION}] Text PLK qty={qty} отвергнут vs НМЦК"
+                        )
+                        qty = None
+                    else:
+                        src = "text_regex"
+                        logger.info(
+                            f"[{self.VERSION}] Text→measurement_points={qty} "
+                            f"(cands={sorted(set(cands))[:8]})"
+                        )
+
+            if qty:
+                tender_info["measurement_points"] = qty
+                tender_info["points_count"] = qty
+                tender_info["points_source"] = src or "excel_nmck"
+                logger.info(
+                    f"[{self.VERSION}] PLK qty={qty} source={tender_info['points_source']}"
+                )
             return
 
         # --- SOUT ---
