@@ -130,10 +130,8 @@ def build_sheets_row(analysis, detail, tender) -> Dict[str, str]:
             )
 
     if not quantity:
-        quantity = get_quantity(analysis)
-
-    if not quantity:
         quantity = "?"
+    quantity = str(quantity)  
 
     app_guarantee, contract_guarantee, guarantee_method = get_guarantee_info(
         detail, analysis
@@ -257,6 +255,12 @@ class GoogleSheetsManager:
 
         self._connect()
 
+    def _ws(self):
+        """Worksheet после _connect; для Pylance."""
+        if self.worksheet is None:
+            raise RuntimeError("Google Sheets worksheet не подключен")
+        return self.worksheet
+
     def _validate_credentials(self) -> Tuple[bool, str]:
         """Проверяет файл credentials перед подключением."""
         creds_path = Path(self.credentials_path)
@@ -291,14 +295,14 @@ class GoogleSheetsManager:
     def ensure_headers(self) -> bool:
         """Проверяет и обновляет заголовки первой строки."""
         try:
-            current_headers = self.worksheet.row_values(1)
+            current_headers = self._ws().row_values(1)
 
             if current_headers == SHEET_COLUMNS:
                 logger.info("✅ Заголовки актуальны")
                 return True
 
             end_col = self._col_index_to_letter(len(SHEET_COLUMNS))
-            self.worksheet.update(f"A1:{end_col}1", [SHEET_COLUMNS])
+            self._ws().update(f"A1:{end_col}1", [SHEET_COLUMNS])
             logger.info(f"✅ Заголовки обновлены: {len(SHEET_COLUMNS)} колонок")
             return True
 
@@ -360,7 +364,7 @@ class GoogleSheetsManager:
         if not tender_id:
             return None
         try:
-            col_a = self.worksheet.col_values(1)
+            col_a = self._ws().col_values(1)
             for i, val in enumerate(col_a[1:], start=2):
                 if str(tender_id) in str(val):
                     logger.info(f"Найден дубликат {tender_id} в строке {i}")
@@ -375,8 +379,15 @@ class GoogleSheetsManager:
             tender_id = data.get("ID тендера", "")
             decision = (data.get("Решение по участию") or "").lower().strip()
 
-            # === Фильтр: записываем только "рекомендуется" ===
-            if decision != "рекомендуется":
+            # === Фильтр: не пишем только явный отказ ===
+            # «рекомендуется» → зелёный, «осторожно» → жёлтый
+            reject_markers = (
+                "не рекомендуется",
+                "нерекомендуется",
+                "отклонен",
+                "отклонён",
+            )
+            if any(m in decision for m in reject_markers):
                 logger.info(
                     f"Пропуск записи в Sheets: {tender_id} "
                     f"(решение = '{data.get('Решение по участию')}')"
@@ -390,24 +401,29 @@ class GoogleSheetsManager:
                     return False
 
             row = [data.get(col, "") for col in SHEET_COLUMNS]
-            self.worksheet.insert_row(row, index=2, value_input_option="USER_ENTERED")
+            self._ws().insert_row(row, index=2, value_input_option="USER_ENTERED")
 
-            # Зелёное форматирование для рекомендованных
-            self._format_row_green(2)
+            if "осторожн" in decision:
+                self._format_row_yellow(2)
+            else:
+                self._format_row_green(2)
 
-            logger.info(f'✅ Тендер {tender_id} добавлен в "{self.worksheet_name}"')
+            logger.info(
+                f'✅ Тендер {tender_id} добавлен в "{self.worksheet_name}" '
+                f"(decision={data.get('Решение по участию')})"
+            )
             return True
 
         except Exception as e:
             logger.error(f"Ошибка добавления тендера: {e}")
             logger.error(f"Traceback:\n{traceback.format_exc()}")
             return False
-    
+
     def update_tender(self, row_number: int, data: Dict) -> bool:
         try:
             row = [data.get(col, "") for col in SHEET_COLUMNS]
             end_col = self._col_index_to_letter(len(SHEET_COLUMNS))
-            self.worksheet.update(f"A{row_number}:{end_col}{row_number}", [row])
+            self._ws().update(f"A{row_number}:{end_col}{row_number}", [row])
             logger.info(f"Строка {row_number} обновлена")
             return True
         except Exception as e:
@@ -424,7 +440,7 @@ class GoogleSheetsManager:
 
     def _format_row_red(self, row_number: int):
         try:
-            self.worksheet.format(
+            self._ws().format(
                 f"A{row_number}:W{row_number}",
                 {"backgroundColor": {"red": 0.95, "green": 0.8, "blue": 0.8}},
             )
@@ -433,7 +449,7 @@ class GoogleSheetsManager:
 
     def _format_row_green(self, row_number: int):
         try:
-            self.worksheet.format(
+            self._ws().format(
                 f"A{row_number}:W{row_number}",
                 {"backgroundColor": {"red": 0.8, "green": 0.95, "blue": 0.8}},
             )
@@ -442,7 +458,7 @@ class GoogleSheetsManager:
 
     def _format_row_yellow(self, row_number: int):
         try:
-            self.worksheet.format(
+            self._ws().format(
                 f"A{row_number}:W{row_number}",
                 {"backgroundColor": {"red": 1.0, "green": 0.95, "blue": 0.8}},
             )
@@ -451,7 +467,7 @@ class GoogleSheetsManager:
 
     def get_all_records(self) -> List[Dict]:
         try:
-            records = self.worksheet.get_all_records()
+            records = self._ws().get_all_records()
             logger.info(f"Получено {len(records)} записей")
             return records
         except Exception as e:
@@ -460,7 +476,7 @@ class GoogleSheetsManager:
 
     def get_last_row_number(self) -> int:
         try:
-            return len(self.worksheet.get_all_values())
+            return len(self._ws().get_all_values())
         except Exception as e:
             logger.error(f"Ошибка: {e}")
             return 1
@@ -468,7 +484,7 @@ class GoogleSheetsManager:
     def check_exists(self, tender_id: str) -> bool:
         """Быстрая проверка наличия тендера в таблице."""
         try:
-            cell = self.worksheet.find(str(tender_id), in_column=1)
+            cell = self._ws().find(str(tender_id), in_column=1)
             return cell is not None
         except Exception:
             return False

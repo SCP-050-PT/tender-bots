@@ -87,16 +87,30 @@ class CalculatorRouter:
             )
             return self._manual_review(f"Ошибка при расчете себестоимости: {e}")
 
-        # 2. SANITY CHECK: Проверка адекватности цены
+        # 2. SANITY CHECK
         nmck = float(tender_info.get("nmck", 0) or 0)
 
         if result and nmck > 0 and result.recommended_price > 0:
             ratio = result.recommended_price / nmck
 
-            if ratio < 0.2 or ratio > 1.5:
+            # Слишком ДОРОГО относительно НМЦК — риск
+            if ratio > 1.5:
                 logger.warning(
-                    f"[{self.VERSION}] SANITY CHECK FAIL: Цена {result.recommended_price:.0f} "
-                    f"при НМЦК {nmck:.0f} (Ratio: {ratio:.2f})"
+                    f"[{self.VERSION}] SANITY: цена {result.recommended_price:.0f} "
+                    f"> 150% НМЦК {nmck:.0f} (ratio={ratio:.2f})"
+                )
+                result.needs_manual_review = True
+                prefix = f"Цена предложения >150% НМЦК ({ratio:.0%}). "
+                result.review_reason = (
+                    f"{prefix}| {result.review_reason}"
+                    if result.review_reason
+                    else f"{prefix}Требуется ручная проверка."
+                )
+            # Очень низкая себестоимость — только инфо (это плюс к участию)
+            elif ratio < 0.2:
+                logger.info(
+                    f"[{self.VERSION}] SANITY: цена {result.recommended_price:.0f} "
+                    f"≪ НМЦК {nmck:.0f} (ratio={ratio:.2f}) — запас по марже, OK"
                 )
                 result.needs_manual_review = True
                 reason_prefix = f"Аномальное соотношение цены к НМЦК ({ratio:.0%}). "
@@ -212,8 +226,34 @@ class CalculatorRouter:
                     result["worker_certs"] += cnt
                 else:
                     result["protocols"] += cnt
-            if any(result.values()):
-                return result
+                    # Если у программ count=null, а students известен — по 1 комплекту docs на программу
+            if students > 0 and not any(result.values()):
+                for p in programs:
+                    if not isinstance(p, dict):
+                        continue
+                    doc_type = (p.get("doc_type") or "protocol").lower()
+                    if doc_type in ("protocol", "протокол"):
+                        result["protocols"] += students
+                    elif doc_type in ("diploma", "диплом"):
+                        result["diplomas"] += students
+                    elif doc_type in ("certificate", "удостоверение", "cert"):
+                        result["certificates"] += students
+                    elif doc_type in (
+                        "qual_cert",
+                        "свидетельство",
+                        "pk",
+                        "certificate_qualification",
+                    ):
+                        result["qual_certs"] += students
+                    elif doc_type in ("worker_cert", "свидетельство рабоч"):
+                        result["worker_certs"] += students
+                    else:
+                        result["protocols"] += students
+                if any(result.values()):
+                    logger.info(
+                        f"[{self.VERSION}] Education docs from programs×students={students}: {result}"
+                    )
+                    return result
 
         # Явные поля от агента / парсера
         for key in ("protocols", "qual_certs", "diplomas", "certificates", "worker_certs"):
