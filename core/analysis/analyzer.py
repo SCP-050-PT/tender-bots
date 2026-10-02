@@ -544,7 +544,17 @@ class TenderAnalyzer:
         Верификация только для профильных тендеров через AgentService.
         """
         tender_id = tender_info.get("reg_number", "UNKNOWN_ID")
-        truncated_text = documents_text[:25000] if documents_text else ""
+        from config.settings import settings
+
+        force_mcp = getattr(settings, "FORCE_MCP_DOCS", False)
+        if force_mcp:
+            truncated_text = ""  # агент только через MCP
+            logger.info(
+                f"[{self.VERSION}] FORCE_MCP_DOCS: в агент текст не передаём "
+                f"(len локального текста={len(documents_text or '')})"
+            )
+        else:
+            truncated_text = documents_text[:25000] if documents_text else ""
 
         parser_context = {
             "tender_id": tender_id,

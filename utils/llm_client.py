@@ -166,7 +166,12 @@ class YandexGPTClient:
                     "reason": f"Timeweb API error: {e}",
                     "llm_unreliable": True,
                 }
-
+        if (documents_text or "").strip():
+            full_user_prompt = (
+                f"{prompt}\n\nТекст документов:\n{documents_text[:100000]}"
+            )
+        else:
+            full_user_prompt = prompt
         # --- Yandex Agent ---
         if self.openai_client and self.agent_id:
             try:

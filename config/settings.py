@@ -67,6 +67,14 @@ class Settings:
             errors.append("GOOGLE_SHEETS_ID не задан")
         return errors
 
+    # === MCP test mode ===
+    # 1 = не кормить агента сырым текстом; документы только через MCP tools
+    FORCE_MCP_DOCS: bool = os.getenv("FORCE_MCP_DOCS", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
 
 # Глобальный инстанс для импорта
 settings = Settings()

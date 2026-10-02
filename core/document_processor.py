@@ -103,6 +103,25 @@ class DocumentProcessor:
         if not documents:
             logger.warning("[DocumentProcessor] Нет документов для обработки")
             return ""
+        
+        from config.settings import settings
+        force_mcp = getattr(settings, "FORCE_MCP_DOCS", False)
+
+        if force_mcp:
+            # Только скачать файлы для MCP, текст не склеивать
+            active = [d for d in documents if d.is_active]
+            for doc in active[:8]:
+                if self._should_skip_file(doc.name):
+                    continue
+                try:
+                    self._download_file(doc, tender_id=tender_id)
+                except Exception as e:
+                    logger.warning(f"[DocumentProcessor] MCP-download {doc.name}: {e}")
+            logger.info(
+                f"[DocumentProcessor] FORCE_MCP_DOCS: скачано без извлечения текста "
+                f"(tender_id={tender_id})"
+            )
+            return ""
 
         active_docs = [d for d in documents if d.is_active]
         logger.info(f"[DocumentProcessor] Активных документов: {len(active_docs)}")

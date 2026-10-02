@@ -562,7 +562,24 @@ async def health():
         "downloads_exists": DOWNLOADS_DIR.exists(),
         "downloads": str(DOWNLOADS_DIR),
     }
-
+@app.post("/call")
+async def direct_tool_call(request: Request):
+    """Прямой вызов tool без SSE (для FORCE_MCP_DOCS из Python)."""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    name = (body.get("name") or "").strip()
+    arguments = body.get("arguments") or {}
+    if not name:
+        raise HTTPException(status_code=400, detail="name required")
+    try:
+        result = await execute_tool(name, arguments)
+        text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+        return {"ok": True, "name": name, "result": text}
+    except Exception as e:
+        mcp_logger.error(f"/call ERROR {name}: {e}")
+        return {"ok": False, "name": name, "error": str(e)}
 
 if __name__ == "__main__":
     import uvicorn
