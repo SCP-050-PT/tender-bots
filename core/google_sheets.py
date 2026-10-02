@@ -49,7 +49,7 @@ SHEET_COLUMNS = [
     "НМЦК",  # L
     "Количество",  # M
     "Цена предложения",  # N
-    "Возможности экономии",  # O
+    "Адреса",  # O
     "Решение по участию",  # P
     "Расчёты",  # Q
     "Комментарий от ИИ-агента",  # R
@@ -117,21 +117,24 @@ def build_sheets_row(analysis, detail, tender) -> Dict[str, str]:
     quantity = None
     t_type = getattr(analysis, "tender_type", "")
 
-    if detail:
+    # после блока if detail: quantity = ...
+    if (not quantity or quantity == "?") and analysis:
+        ad = getattr(analysis, "details", None) or {}
+        if not isinstance(ad, dict):
+            ad = {}
         if t_type == "sout":
-            quantity = getattr(detail, "rm_total", None)
+            quantity = ad.get("rm_total") or getattr(analysis, "rm_total", None)
         elif t_type == "plk":
-            quantity = getattr(detail, "points_count", None)
+            quantity = ad.get("measurement_points") or ad.get("points_count")
         elif t_type == "education":
-            quantity = getattr(detail, "students_count", None)
-        elif t_type == "opr":
-            quantity = getattr(detail, "opr_positions", None) or getattr(
-                detail, "rm_total", None
+            quantity = ad.get("students_count") or getattr(
+                analysis, "students_count", None
             )
-
+        elif t_type == "opr":
+            quantity = ad.get("opr_positions") or ad.get("opr_persons")
     if not quantity:
         quantity = "?"
-    quantity = str(quantity)  
+    quantity = str(quantity)
 
     app_guarantee, contract_guarantee, guarantee_method = get_guarantee_info(
         detail, analysis
@@ -189,6 +192,61 @@ def build_sheets_row(analysis, detail, tender) -> Dict[str, str]:
         detail.nmck if detail and getattr(detail, "nmck", None) else 0
     ) or getattr(analysis, "nmck", 0)
 
+    # --- Адреса / города для колонки O ---
+    def _fmt_addresses(analysis, detail) -> str:
+        parts = []
+        d = getattr(analysis, "details", None) or {}
+        if not isinstance(d, dict):
+            d = {}
+
+        cities = (
+            d.get("cities")
+            or d.get("cities_list")
+            or getattr(analysis, "cities", None)
+            or []
+        )
+        addresses = (
+            d.get("addresses")
+            or d.get("addresses_list")
+            or getattr(analysis, "addresses", None)
+            or []
+        )
+        if isinstance(cities, str):
+            cities = [c.strip() for c in cities.split(";") if c.strip()]
+        if isinstance(addresses, str):
+            addresses = [a.strip() for a in addresses.split(";") if a.strip()]
+
+        n_c = d.get("cities_count") or getattr(analysis, "cities_count", None)
+        n_a = d.get("addresses_count") or getattr(analysis, "addresses_count", None)
+        n_r = d.get("regions_count") or getattr(analysis, "regions_count", None)
+
+        if cities:
+            parts.append("; ".join(str(c) for c in cities[:8]))
+        elif addresses:
+            parts.append("; ".join(str(a) for a in addresses[:5]))
+
+        meta = []
+        if n_c:
+            meta.append(f"{n_c} гор.")
+        if n_a and n_a != n_c:
+            meta.append(f"{n_a} адр.")
+        if n_r and int(n_r or 0) > 1:
+            meta.append(f"{n_r} рег.")
+        if meta:
+            parts.append("(" + ", ".join(meta) + ")")
+
+        text = " · ".join(parts).strip() if parts else ""
+        if not text and detail:
+            # fallback: адрес заказчика из карточки
+            ca = getattr(detail, "customer_address", None) or getattr(
+                detail, "delivery_address", None
+            )
+            if ca:
+                text = str(ca)[:180]
+        return (text or "не извлечено")[:220]
+
+    addresses_cell = _fmt_addresses(analysis, detail)
+
     return {
         "ID тендера": tender.tender_id,
         "Ссылка на тендер": getattr(tender, "url", ""),
@@ -208,7 +266,7 @@ def build_sheets_row(analysis, detail, tender) -> Dict[str, str]:
         "НМЦК": _format_nmck(nmck_val),
         "Количество": quantity,
         "Цена предложения": _format_price(getattr(analysis, "recommended_price", 0)),
-        "Возможности экономии": "",
+        "Адреса": addresses_cell,
         "Решение по участию": decision_override,
         "Расчёты": sanitize_for_sheets(build_calculation_breakdown(analysis)),
         "Комментарий от ИИ-агента": ai_comment,

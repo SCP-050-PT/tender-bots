@@ -3,7 +3,11 @@
 main.py
 Интеграционный скрипт TENDER-BOT v7.8.0.
 Пайплайн: Поиск -> Детальный парсинг -> LLM-анализ -> Расчёт -> Риски -> Google Sheets
-Запуск: python main.py --analyze --max-results 10
+Запуск:
+  python main.py --analyze --max-results 10
+  python main.py --analyze --max-results 5 --opr
+  python main.py --analyze --max-results 5 --sout --plk
+  python main.py --analyze --max-results 5 --types education,sout
 """
 
 import sys
@@ -22,17 +26,14 @@ from core.daily_limiter import DailyLimiter
 LOG_DIR = Path(__file__).resolve().parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 
-# Удаляем стандартные хендлеры
 logger.remove()
 
-# Стандартный вывод в консоль
 logger.add(
     sys.stdout,
     level="INFO",
     format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | {message}",
 )
 
-# Общий лог файл
 logger.add(
     "tender.log",
     level="DEBUG",
@@ -43,7 +44,6 @@ logger.add(
     diagnose=True,
 )
 
-# Лог запуска
 logger.add(
     LOG_DIR / "run_{time:YYYYMMDD_HHmmss}.log",
     level="DEBUG",
@@ -54,7 +54,6 @@ logger.add(
     diagnose=True,
 )
 
-# === Отдельный лог для "мышления" агента ===
 logger.add(
     LOG_DIR / "agent_thinking_{time:YYYYMMDD}.log",
     level="DEBUG",
@@ -91,11 +90,13 @@ def build_tender_text(detail, documents_text: str, tender_info: dict = None) -> 
         ktru_parts = []
         if tender_info.get("rm_total"):
             ktru_parts.append(
-                f"   РМ: {tender_info['rm_total']} ({tender_info.get('rm_total_source', 'парсер')})"
+                f"   РМ: {tender_info['rm_total']} "
+                f"({tender_info.get('rm_total_source', 'парсер')})"
             )
         if tender_info.get("students_count"):
             ktru_parts.append(
-                f"   Слушатели: {tender_info['students_count']} ({tender_info.get('students_count_source', 'парсер')})"
+                f"   Слушатели: {tender_info['students_count']} "
+                f"({tender_info.get('students_count_source', 'парсер')})"
             )
         if tender_info.get("points_count"):
             ktru_parts.append(
@@ -119,14 +120,60 @@ def build_tender_text(detail, documents_text: str, tender_info: dict = None) -> 
     return "\n".join(parts)
 
 
+def _guess_type_hint(tender, detail) -> str | None:
+    """Быстрый hint по КТРУ / title до полного analyze (для type_filter)."""
+    if detail:
+        if (getattr(detail, "students_count", 0) or 0) > 0:
+            return "education"
+        if (getattr(detail, "rm_total", 0) or 0) > 0:
+            return "sout"
+        if (getattr(detail, "points_count", 0) or 0) > 0:
+            return "plk"
+        if (getattr(detail, "opr_positions", 0) or 0) > 0:
+            return "opr"
+        hint = getattr(detail, "tender_type_hint", None)
+        if hint:
+            return hint
+
+    title = (getattr(tender, "title", None) or "").lower()
+    if not title:
+        return None
+
+    try:
+        from core.services.type_service import TypeService
+
+        ts = TypeService()
+        for ttype, keywords in getattr(ts, "TITLE_KEYWORDS", {}).items():
+            if any(kw in title for kw in keywords):
+                return ttype
+        # NEGATIVE → other
+        for neg in getattr(ts, "NEGATIVE_KEYWORDS", []):
+            if neg in title:
+                return "other"
+    except Exception:
+        pass
+
+    return None
+
+
 def run_analyze(
-    max_pages: int = None, max_results: int = None, skip_detail: bool = False
+    max_pages: int = None,
+    max_results: int = None,
+    skip_detail: bool = False,
+    type_filter: list = None,
 ):
     """Полный анализ с LLM."""
     logger.info("=" * 60)
-    logger.info(" РЕЖИМ: Полный анализ с LLM. Логирование 'мышления' агента включено: logs/agent_thinking_*.log")
+    logger.info(
+        " РЕЖИМ: Полный анализ с LLM. "
+        "Логирование 'мышления' агента включено: logs/agent_thinking_*.log"
+    )
     limiter = DailyLimiter()
     logger.info(limiter.get_status())
+
+    type_filter = [t.lower().strip() for t in (type_filter or []) if t]
+    if type_filter:
+        logger.info(f" Фильтр типов: {', '.join(type_filter)}")
 
     can_run, reason = limiter.can_run()
     if not can_run:
@@ -160,6 +207,7 @@ def run_analyze(
         logger.debug(f" Кэш инициализирован: {cache_db}")
     except Exception as e:
         logger.warning(f" Кэш не инициализирован: {e}")
+        cache = None
 
     detailed = None
     if not skip_detail:
@@ -184,6 +232,7 @@ def run_analyze(
     sheets_rows = []
     analyzed_count = 0
     duplicates_skipped = 0
+    type_skipped = 0
     added_to_sheets_count = 0
     errors_count = 0
     time.sleep(5)
@@ -234,7 +283,8 @@ def run_analyze(
 
                 if detail:
                     logger.info(
-                        f"   Детали получены: {detail.customer_region or 'регион не определён'}"
+                        f"   Детали получены: "
+                        f"{detail.customer_region or 'регион не определён'}"
                     )
                     logger.info(f"   Документов: {len(detail.documents)}")
                     logger.info(
@@ -276,7 +326,8 @@ def run_analyze(
                     if documents_text and len(documents_text) > 1000:
                         tender_text = documents_text
                         logger.info(
-                            f"   Используется полный текст документов ({len(documents_text)} симв.)"
+                            f"   Используется полный текст документов "
+                            f"({len(documents_text)} симв.)"
                         )
                 else:
                     logger.warning("   Детальный парсинг вернул None")
@@ -284,7 +335,18 @@ def run_analyze(
                 logger.error(f"   Ошибка детального парсинга: {e}")
                 detail = None
 
-        # === ШАГ 2: Подготовка контекста tender_info ===
+        # === Ранний type_filter (до LLM, экономия токенов) ===
+        early_hint = _guess_type_hint(tender, detail)
+        if type_filter and early_hint and early_hint not in type_filter:
+            logger.info(
+                f"   Пропуск по типу (early): {early_hint} ∉ {type_filter} "
+                f"({tender.tender_id})"
+            )
+            type_skipped += 1
+            # не кладём в кэш — иначе при смене фильтра тендер пропадёт
+            continue
+
+        # === ШАГ 2: tender_info ===
         tender_info = {}
         if detail:
             tender_info = {
@@ -328,18 +390,21 @@ def run_analyze(
                 tender_info["students_count_source"] = "ktru"
             if (detail.points_count or 0) > 0:
                 tender_info["points_count"] = detail.points_count
-
-            if detail.has_full_time:
-                ...
+                tender_info["points_source"] = "ktru"
             if (detail.opr_positions or 0) > 0:
                 tender_info["opr_positions"] = detail.opr_positions
-            if (detail.opr_persons or 0) > 0:
+                tender_info["opr_positions_source"] = "ktru"
+            if (getattr(detail, "opr_persons", 0) or 0) > 0:
                 tender_info["opr_persons"] = detail.opr_persons
+
+            if getattr(detail, "has_full_time", False):
+                tender_info["has_full_time"] = True
+
             tender_info["needs_subcontractor"] = getattr(
                 detail, "needs_subcontractor", False
             )
 
-        # === ШАГ 3: Fallback — создание текста тендера при необходимости ===
+        # === ШАГ 3: Fallback-текст ===
         if not tender_text:
             if detail:
                 tender_text = build_tender_text(detail, documents_text, tender_info)
@@ -349,31 +414,33 @@ def run_analyze(
                     if documents_text and len(documents_text) > 100
                     else ""
                 )
-                tender_text = f"НАЗВАНИЕ ЗАКУПКИ:\n{tender.title}\n\nЗАКАЗЧИК:\n{tender.customer or 'не указан'}\n\nРЕГИОН:\n{getattr(tender, 'region', '') or 'не указан'}\n\nНМЦК:\n{tender.nmck or 'не указана'}\n\nЗАКОН:\n{tender.law}{doc_part}"
+                tender_text = (
+                    f"НАЗВАНИЕ ЗАКУПКИ:\n{tender.title}\n\n"
+                    f"ЗАКАЗЧИК:\n{tender.customer or 'не указан'}\n\n"
+                    f"РЕГИОН:\n{getattr(tender, 'region', '') or 'не указан'}\n\n"
+                    f"НМЦК:\n{tender.nmck or 'не указана'}\n\n"
+                    f"ЗАКОН:\n{tender.law}{doc_part}"
+                )
                 logger.info("   Используется упрощённый текст (title only)")
 
         # === ШАГ 4: LLM-анализ ===
         try:
-            type_hint = detail.tender_type_hint if detail else None
-            logger.debug(
-                f"[DEBUG] Passing to analyzer: nmck={tender.nmck}, students={tender_info.get('students_count', 'N/A')}, rm={tender_info.get('rm_total', 'N/A')}, hint={type_hint}"
-            )
-
-            if not type_hint and tender.title:
-                from core.services.type_service import TypeService
-
-                _ts = TypeService()
-                _title_lower = tender.title.lower()
-                for _ttype, _keywords in _ts.TITLE_KEYWORDS.items():
-                    if any(_kw in _title_lower for _kw in _keywords):
-                        type_hint = _ttype
-                        break
+            type_hint = early_hint
+            if detail and getattr(detail, "tender_type_hint", None):
+                type_hint = detail.tender_type_hint or type_hint
 
             if detail and (detail.students_count or 0) > 0 and type_hint == "sout":
                 logger.warning(
-                    f"[v7.2.4] Override: sout → education (КТРУ дал {detail.students_count} слушателей)"
+                    f"[v7.2.4] Override: sout → education "
+                    f"(КТРУ дал {detail.students_count} слушателей)"
                 )
                 type_hint = "education"
+
+            logger.debug(
+                f"[DEBUG] analyzer: nmck={tender.nmck}, "
+                f"students={tender_info.get('students_count', 'N/A')}, "
+                f"rm={tender_info.get('rm_total', 'N/A')}, hint={type_hint}"
+            )
 
             analysis = analyzer.analyze(
                 tender_info=tender_info,
@@ -383,9 +450,17 @@ def run_analyze(
                 tender_type_hint=type_hint,
             )
 
-            result_dict = analysis.to_dict()
+            # Финальный type_filter (после analyze — на случай смены типа агентом)
+            ttype = (getattr(analysis, "tender_type", "") or "").lower()
+            if type_filter and ttype and ttype not in type_filter:
+                logger.info(
+                    f"   Пропуск по типу (post-analyze): {ttype} ∉ {type_filter} "
+                    f"({tender.tender_id})"
+                )
+                type_skipped += 1
+                continue
 
-            # ВЫЗОВ ВЫНЕСЕННОЙ ФУНКЦИИ ИЗ core.google_sheets
+            result_dict = analysis.to_dict()
             row = build_sheets_row(analysis, detail, tender)
             sheets_rows.append(row)
 
@@ -395,28 +470,34 @@ def run_analyze(
 
             if sheets_manager:
                 try:
-                    was_added = sheets_manager.add_tender_to_top(row, check_duplicate=False)
+                    was_added = sheets_manager.add_tender_to_top(
+                        row, check_duplicate=False
+                    )
                     if was_added:
                         added_to_sheets_count += 1
                         logger.info("   Записано в Google Sheets")
-                    # иначе уже есть лог "Пропуск записи..." внутри add_tender_to_top
                 except Exception as e:
                     logger.warning(f"   Ошибка записи в Sheets: {e}")
 
             print(f"\n{'=' * 60}\n РЕЗУЛЬТАТ: {tender.tender_id}\n{'=' * 60}")
             print(f"Тип: {analysis.tender_type} | НМЦК: {analysis.nmck:,.0f} ₽")
             print(
-                f"Себестоимость: {analysis.cost_price:,.0f} ₽ | Цена: {analysis.recommended_price:,.0f} ₽"
+                f"Себестоимость: {analysis.cost_price:,.0f} ₽ | "
+                f"Цена: {analysis.recommended_price:,.0f} ₽"
             )
             print(
-                f"Маржа: {analysis.margin_percent:.1f}% | Риск: {analysis.risk_level} | Решение: {analysis.decision}"
+                f"Маржа: {analysis.margin_percent:.1f}% | "
+                f"Риск: {analysis.risk_level} | Решение: {analysis.decision}"
             )
             if getattr(analysis, "needs_manual_review", False):
                 print(" ТРЕБУЕТСЯ РУЧНАЯ ПРОВЕРКА")
             if detail and detail.customer_region:
                 print(f"Регион: {detail.customer_region}")
+            comment = analysis.comment or ""
             print(
-                f"{'-' * 60}\nКомментарий:\n{analysis.comment[:400] + '...' if len(analysis.comment) > 400 else analysis.comment}\n{'=' * 60}"
+                f"{'-' * 60}\nКомментарий:\n"
+                f"{comment[:400] + '...' if len(comment) > 400 else comment}\n"
+                f"{'=' * 60}"
             )
 
         except Exception as e:
@@ -438,6 +519,7 @@ def run_analyze(
                     "analysis_date": datetime.now().isoformat(),
                     "total": len(results),
                     "duplicates_skipped": duplicates_skipped,
+                    "type_skipped": type_skipped,
                     "results": results,
                 },
                 f,
@@ -453,16 +535,17 @@ def run_analyze(
             writer.writerows(sheets_rows)
         logger.info(f" CSV сохранён: {csv_file}")
 
-    # Вывод красивого лога через утилиту
     log_pipeline_summary(
         {
-            "total": analyzed_count + duplicates_skipped,
+            "total": analyzed_count + duplicates_skipped + type_skipped,
             "processed": analyzed_count,
-            "skipped": duplicates_skipped,
+            "skipped": duplicates_skipped + type_skipped,
             "added_to_sheets": added_to_sheets_count,
             "errors": errors_count,
         }
     )
+    if type_skipped:
+        logger.info(f"   • Пропущено по type_filter: {type_skipped}")
 
     limiter.record_tenders(len(results))
     return results, sheets_rows
@@ -472,6 +555,12 @@ def main():
     parser = argparse.ArgumentParser(
         description="TENDER-BOT v7.8.0: Анализ тендеров с ИИ",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Примеры:\n"
+            "  python main.py --analyze --max-results 5 --opr\n"
+            "  python main.py --analyze --max-results 10 --sout --plk\n"
+            "  python main.py --analyze --max-results 5 --types education,sout\n"
+        ),
     )
 
     parser.add_argument(
@@ -484,21 +573,50 @@ def main():
         "--max-pages", type=int, default=None, help="Максимум страниц поиска"
     )
     parser.add_argument(
-        "--max-results", type=int, default=None, help="Максимум тендеров для обработки"
+        "--max-results",
+        type=int,
+        default=None,
+        help="Максимум тендеров для полной обработки",
     )
     parser.add_argument(
         "--skip-detail",
         action="store_true",
         help="Быстрый анализ без глубокого скачивания документов",
     )
+    parser.add_argument(
+        "--types",
+        type=str,
+        default=None,
+        help="Типы через запятую: sout,opr,plk,education (или all)",
+    )
+    parser.add_argument("--sout", action="store_true", help="Только СОУТ")
+    parser.add_argument("--opr", action="store_true", help="Только ОПР")
+    parser.add_argument("--plk", action="store_true", help="Только ПЛК")
+    parser.add_argument("--education", action="store_true", help="Только обучение")
 
     args = parser.parse_args()
+
+    type_filter = []
+    if args.types and args.types.strip().lower() not in ("all", "*", ""):
+        type_filter.extend(
+            x.strip().lower() for x in args.types.split(",") if x.strip()
+        )
+    if args.sout:
+        type_filter.append("sout")
+    if args.opr:
+        type_filter.append("opr")
+    if args.plk:
+        type_filter.append("plk")
+    if args.education:
+        type_filter.append("education")
+    type_filter = list(dict.fromkeys(type_filter))
 
     if args.analyze:
         run_analyze(
             max_pages=args.max_pages,
             max_results=args.max_results,
             skip_detail=args.skip_detail,
+            type_filter=type_filter or None,
         )
 
 
