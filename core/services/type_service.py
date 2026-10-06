@@ -230,6 +230,8 @@ class TypeService:
             "оценки условий труда",
             "оценке условий труда",
             "специальная оценка рабочих мест",
+            "специальная оценка труда",
+            "специальной оценки труда",
         ],
         "plk": [
             "производственный лабораторный контроль",
@@ -290,6 +292,8 @@ class TypeService:
         "other": "other",
         "unknown": "unknown",
         "testing": "testing",
+        "sout_opr": "combined",
+        "opr_sout": "combined",
     }
 
     @staticmethod
@@ -520,6 +524,36 @@ class TypeService:
         # ШАГ 3: Title heuristic (education → sout → plk → opr)
         # ============================================================
         name_for_title = title_l if title_l.strip() else purchase_name
+        # --- COMBINED: СОУТ + ОПР в одном названии ---
+        if name_for_title.strip():
+            has_sout_title = any(
+                kw in name_for_title
+                for kw in (
+                    "специальная оценка",
+                    "специальной оценки",
+                    "специальной оценке",
+                    "соут",
+                    "оценка условий труда",
+                    "оценки условий труда",
+                    "оценка труда",  # «специальная оценка труда» без «условий»
+                )
+            )
+            has_opr_title = self._has_opr_token(name_for_title) or any(
+                kw in name_for_title
+                for kw in (
+                    "профессиональных рисков",
+                    "профессиональный риск",
+                    "оценка профессиональных рисков",
+                    "оценки профессиональных рисков",
+                    "идентификация опасностей",
+                )
+            )
+            if has_sout_title and has_opr_title:
+                logger.info(
+                    f"[{self.VERSION}] Тип из title: combined (СОУТ+ОПР) "
+                    f"('{name_for_title[:70]}...')"
+                )
+                return "combined", "title_combined_sout_opr", "heuristic"
 
         if name_for_title.strip():
             for ttype in self.TITLE_ORDER:

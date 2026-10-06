@@ -115,21 +115,37 @@ def get_guarantee_info(detail, analysis) -> Tuple[str, str, str]:
 def build_sheets_row(analysis, detail, tender) -> Dict[str, str]:
     """Формирует строковый словарь для Google Sheets с приоритетом данных парсера."""
     quantity = None
-    t_type = getattr(analysis, "tender_type", "")
+    t_type = getattr(analysis, "tender_type", "") or ""
+    ad = {}
+    if hasattr(analysis, "details") and analysis.details:
+        ad = analysis.details if isinstance(analysis.details, dict) else {}
 
-    # после блока if detail: quantity = ...
-    if (not quantity or quantity == "?") and analysis:
-        ad = getattr(analysis, "details", None) or {}
-        if not isinstance(ad, dict):
-            ad = {}
-        if t_type == "sout":
-            quantity = ad.get("rm_total") or getattr(analysis, "rm_total", None)
+    if detail:
+        if t_type in ("sout", "combined"):
+            quantity = getattr(detail, "rm_total", None) or ad.get("rm_total")
+        elif t_type == "plk":
+            quantity = getattr(detail, "points_count", None) or ad.get(
+                "measurement_points"
+            ) or ad.get("points_count")
+        elif t_type == "education":
+            quantity = getattr(detail, "students_count", None) or ad.get(
+                "students_count"
+            )
+        elif t_type == "opr":
+            quantity = (
+                getattr(detail, "opr_positions", None)
+                or getattr(detail, "rm_total", None)
+                or ad.get("opr_positions")
+                or ad.get("rm_total")
+            )
+
+    if not quantity:
+        if t_type in ("sout", "combined"):
+            quantity = ad.get("rm_total")
         elif t_type == "plk":
             quantity = ad.get("measurement_points") or ad.get("points_count")
         elif t_type == "education":
-            quantity = ad.get("students_count") or getattr(
-                analysis, "students_count", None
-            )
+            quantity = ad.get("students_count")
         elif t_type == "opr":
             quantity = ad.get("opr_positions") or ad.get("opr_persons")
     if not quantity:
@@ -193,33 +209,19 @@ def build_sheets_row(analysis, detail, tender) -> Dict[str, str]:
     ) or getattr(analysis, "nmck", 0)
 
     # --- Адреса / города для колонки O ---
-    def _fmt_addresses(analysis, detail) -> str:
-        parts = []
-        d = getattr(analysis, "details", None) or {}
-        if not isinstance(d, dict):
-            d = {}
-
-        cities = (
-            d.get("cities")
-            or d.get("cities_list")
-            or getattr(analysis, "cities", None)
-            or []
-        )
-        addresses = (
-            d.get("addresses")
-            or d.get("addresses_list")
-            or getattr(analysis, "addresses", None)
-            or []
-        )
+    def _fmt_addresses() -> str:
+        cities = ad.get("cities") or ad.get("cities_list") or []
+        addresses = ad.get("addresses") or ad.get("addresses_list") or []
         if isinstance(cities, str):
             cities = [c.strip() for c in cities.split(";") if c.strip()]
         if isinstance(addresses, str):
             addresses = [a.strip() for a in addresses.split(";") if a.strip()]
 
-        n_c = d.get("cities_count") or getattr(analysis, "cities_count", None)
-        n_a = d.get("addresses_count") or getattr(analysis, "addresses_count", None)
-        n_r = d.get("regions_count") or getattr(analysis, "regions_count", None)
+        n_c = ad.get("cities_count")
+        n_a = ad.get("addresses_count")
+        n_r = ad.get("regions_count")
 
+        parts = []
         if cities:
             parts.append("; ".join(str(c) for c in cities[:8]))
         elif addresses:
@@ -232,20 +234,22 @@ def build_sheets_row(analysis, detail, tender) -> Dict[str, str]:
             meta.append(f"{n_a} адр.")
         if n_r and int(n_r or 0) > 1:
             meta.append(f"{n_r} рег.")
-        if meta:
-            parts.append("(" + ", ".join(meta) + ")")
 
-        text = " · ".join(parts).strip() if parts else ""
-        if not text and detail:
-            # fallback: адрес заказчика из карточки
+        if parts and meta:
+            return (parts[0] + " (" + ", ".join(meta) + ")")[:220]
+        if parts:
+            return parts[0][:220]
+        if meta:
+            return (", ".join(meta) + " — список не извлечён")[:220]
+        if detail:
             ca = getattr(detail, "customer_address", None) or getattr(
                 detail, "delivery_address", None
             )
             if ca:
-                text = str(ca)[:180]
-        return (text or "не извлечено")[:220]
+                return str(ca)[:180]
+        return "не извлечено"
 
-    addresses_cell = _fmt_addresses(analysis, detail)
+    addresses_cell = _fmt_addresses()
 
     return {
         "ID тендера": tender.tender_id,

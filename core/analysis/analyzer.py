@@ -176,7 +176,6 @@ class TenderAnalyzer:
                 return min(pool, key=lambda q: abs(q - target))
             return max(pool)
 
-
             # --- OPR ---
         if tender_type == "opr" and not (
             tender_info.get("opr_positions") or tender_info.get("opr_persons")
@@ -515,7 +514,30 @@ class TenderAnalyzer:
         agent_logger.info(
             f"✅ АНАЛИЗ ЗАВЕРШЕН: тип={tender_type}, решение={risk_result['decision']}"
         )
-
+        # Пробрасываем geo/qty в details → Google Sheets (колонка «Адреса»)
+        details_out = dict(result.details) if result.details else {}
+        for k in (
+            "cities",
+            "cities_list",
+            "addresses",
+            "addresses_list",
+            "cities_count",
+            "addresses_count",
+            "regions_count",
+            "is_remote_region",
+            "rm_total",
+            "opr_positions",
+            "opr_persons",
+            "measurement_points",
+            "points_count",
+            "students_count",
+            "rm_total_source",
+            "opr_positions_source",
+            "points_source",
+            "students_count_source",
+        ):
+            if tender_info.get(k) is not None:
+                details_out[k] = tender_info[k]
         return AnalysisResult(
             tender_type=tender_type,
             cost_price=result.cost_price,
@@ -525,7 +547,7 @@ class TenderAnalyzer:
             decision=risk_result["decision"],
             needs_manual_review=result.needs_manual_review,
             llm_confidence=llm_confidence,
-            details=result.details,
+            details=details_out,
             comment=comment,
             review_reason=result.review_reason,
             type_detection_source=type_source,
@@ -915,6 +937,42 @@ class TenderAnalyzer:
         region = (
             tender_info.get("region") or tender_info.get("customer_region") or ""
         ).lower()
+        # --- Списки городов/адресов для Sheets (колонка «Адреса») ---
+        final_cities: List[str] = []
+        final_addrs: List[str] = []
+
+        if agent_has_list:
+            if isinstance(agent_city_list, list):
+                final_cities = [
+                    str(c).strip() for c in agent_city_list if str(c).strip()
+                ]
+            if isinstance(agent_addr_list, list):
+                final_addrs = [
+                    str(a).strip() for a in agent_addr_list if str(a).strip()
+                ]
+        if not final_cities and p_city_list:
+            final_cities = [str(c).strip() for c in p_city_list if str(c).strip()]
+        if not final_addrs and p_addr_list:
+            final_addrs = [str(a).strip() for a in p_addr_list if str(a).strip()]
+
+        # после geo-cap числа могли уменьшиться — списки обрезаем
+        cap_c = int(tender_info.get("cities_count") or 0) or len(final_cities)
+        if final_cities and cap_c > 0:
+            final_cities = final_cities[: max(cap_c, 3)]
+        if final_addrs:
+            final_addrs = final_addrs[:10]
+
+        if final_cities:
+            tender_info["cities"] = final_cities
+            tender_info["cities_list"] = final_cities
+        if final_addrs:
+            tender_info["addresses"] = final_addrs
+            tender_info["addresses_list"] = final_addrs
+
+        logger.info(
+            f"[{self.VERSION}] GEO lists → Sheets: cities={final_cities} "
+            f"addresses={final_addrs[:3]}..."
+        )
         home_markers = ("свердлов", "екатеринбург", "екат")
         tender_info["is_remote_region"] = bool(region) and not any(
             h in region for h in home_markers
