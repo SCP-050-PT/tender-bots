@@ -53,7 +53,7 @@ class TenderAnalyzer:
         "агора": 0.8,
     }
 
-    PROFITABLE_TYPES = {"sout", "opr", "sout_opr", "plk", "education"}
+    PROFITABLE_TYPES = {"sout", "opr", "sout_opr", "plk", "education", "combined"}
 
     # Источники qty, которые агент не имеет права перебить
     TRUSTED_QTY_SOURCES = (
@@ -446,6 +446,21 @@ class TenderAnalyzer:
             self._apply_excel_quantities(tender_info, documents_text, tender_type)
             self.fallback_service.apply(tender_info, tender_type)
 
+            # qty только из НМЦК → не выше «осторожно»
+            src = (
+                tender_info.get("rm_total_source")
+                or tender_info.get("students_count_source")
+                or tender_info.get("opr_positions_source")
+                or tender_info.get("points_source")
+                or ""
+            )
+            if "nmck_estimate" in str(src).lower():
+                tender_info["needs_manual_review"] = True
+                # опционально жёстко: чтобы decision не был «рекомендуется»
+                # передаётся в risk_analyzer уже через needs_manual_review
+            
+        
+
         nmck = tender_info.get("nmck", 0)
         deadline_days = tender_info.get("deadline_days", 30)
         etp_commission = self._resolve_etp_commission(tender_info)
@@ -719,6 +734,8 @@ class TenderAnalyzer:
                 )
                 agent_logger.warning(f"⚠️ NULL от агента: {qk}")
 
+        
+        
         for key, value in extracted.items():
             # null / служебные — не затираем уже найденное
             if value is None or key.startswith("_"):
@@ -740,8 +757,15 @@ class TenderAnalyzer:
                         continue
 
             # Числовые qty от агента только если > 0
-            if key in PROTECTED and isinstance(value, (int, float)) and value <= 0:
-                continue
+            if key == "students_count" and tender_type == "education":
+                agent_v = int(value or 0)
+                old_v = int(old or 0)
+                # агент/programs заметно больше частичного КТРУ — не блокируем
+                if agent_v > old_v * 1.15:
+                    logger.info(
+                        f"[{self.VERSION}] Education: agent {agent_v} > ktru {old_v} — "
+                        "снимем protect, решим после programs[]"
+                    )
 
             old_val = tender_info.get(key)
             tender_info[key] = value
@@ -770,7 +794,7 @@ class TenderAnalyzer:
             )
             tender_info["needs_manual_review"] = True
             return  # не считать education/sout по ошибке
-        
+
         # agent_notes от модели
         notes = extracted.get("agent_notes")
         if isinstance(notes, list) and notes:
@@ -795,23 +819,21 @@ class TenderAnalyzer:
         # === Education ===
         if tender_type == "education":
             programs = tender_info.get("programs") or []
+            program_sum = 0
+            doc_sum = 0
             if isinstance(programs, list) and programs:
-                doc_sum = 0
-                unique_candidates = []
                 for p in programs:
                     if not isinstance(p, dict):
                         continue
                     cnt = int(p.get("count") or 0)
                     if cnt <= 0:
                         continue
-                    unique_candidates.append(cnt)
+                    program_sum += cnt
                     doc_type = (p.get("doc_type") or "protocol").lower()
                     if doc_type in ("protocol", "протокол"):
                         doc_sum += cnt
                     elif doc_type in ("diploma", "диплом"):
-                        tender_info["diplomas"] = (
-                            int(tender_info.get("diplomas") or 0) + cnt
-                        )
+                        tender_info["diplomas"] = int(tender_info.get("diplomas") or 0) + cnt
                     elif doc_type in ("certificate", "удостоверение", "cert"):
                         tender_info["certificates"] = (
                             int(tender_info.get("certificates") or 0) + cnt
@@ -823,27 +845,48 @@ class TenderAnalyzer:
                     else:
                         doc_sum += cnt
 
-                if pre_agent_students > 0:
-                    unique_students = pre_agent_students
-                elif unique_candidates:
-                    unique_students = max(unique_candidates)
-                else:
-                    unique_students = int(tender_info.get("students_count") or 0)
+            agent_students = int(extracted.get("students_count") or 0)
+            ktru_students = pre_agent_students  # до merge
 
-                if unique_students > 0:
-                    old = tender_info.get("students_count")
-                    tender_info["students_count"] = unique_students
-                    if old and int(old) != unique_students:
-                        logger.info(
-                            f"[{self.VERSION}] Education students: "
-                            f"{old} → {unique_students} (unique/KTRU, not sum)"
-                        )
-                if doc_sum > 0 and not tender_info.get("protocols_count"):
-                    tender_info["protocols_count"] = doc_sum
-                elif doc_sum > 0:
-                    tender_info["protocols_count"] = max(
-                        int(tender_info.get("protocols_count") or 0), doc_sum
+            # Приоритет: сумма программ > agent > ktru (если agent/programs заметно больше)
+            candidates = [x for x in (program_sum, agent_students, ktru_students) if x > 0]
+            if program_sum > 0 and ktru_students > 0 and program_sum > ktru_students * 1.15:
+                chosen = program_sum
+                src = "programs_sum"
+            elif (
+                agent_students > 0
+                and ktru_students > 0
+                and agent_students > ktru_students * 1.15
+            ):
+                chosen = agent_students
+                src = "agent_over_ktru"
+                tender_info["needs_manual_review"] = True
+            elif candidates:
+                # близкие значения — max; иначе ktru если есть
+                chosen = (
+                    max(candidates)
+                    if (max(candidates) <= min(candidates) * 1.2)
+                    else (ktru_students or max(candidates))
+                )
+                src = tender_info.get("students_count_source") or "merged"
+            else:
+                chosen = 0
+                src = ""
+
+            if chosen > 0:
+                old = tender_info.get("students_count")
+                tender_info["students_count"] = chosen
+                tender_info["students_count_source"] = src
+                if old and int(old) != chosen:
+                    logger.info(
+                        f"[{self.VERSION}] Education students: {old} → {chosen} ({src})"
                     )
+                    agent_logger.info(f"📊 Education qty: {old} → {chosen} ({src})")
+
+            if doc_sum > 0:
+                tender_info["protocols_count"] = max(
+                    int(tender_info.get("protocols_count") or 0), doc_sum
+                )
 
         # === Пост-проверка аккредитации ===
         blocked_factors = []
@@ -994,17 +1037,15 @@ class TenderAnalyzer:
         regions = int(tender_info.get("regions_count") or 1)
         has_explicit_list = bool(final_cities or final_addrs or agent_has_list)
 
-        if has_explicit_list:
+        if agent_has_list or (final_cities and len(final_cities) > 1) or (final_addrs and len(final_addrs) > 1):
+            # числа = длины списков, без искусственного cap 3
             if final_cities:
                 tender_info["cities_count"] = len(final_cities)
             if final_addrs:
-                tender_info["addresses_count"] = max(
-                    int(tender_info.get("addresses_count") or 0), len(final_addrs)
-                )
+                tender_info["addresses_count"] = len(final_addrs)
             logger.info(
                 f"[{self.VERSION}] GEO без капа (есть список): "
-                f"cities={tender_info.get('cities_count')} "
-                f"addr={tender_info.get('addresses_count')}"
+                f"cities={tender_info.get('cities_count')} addr={tender_info.get('addresses_count')}"
             )
         else:
             capped = min(cities, 3) if regions <= 1 else min(cities, 4)
@@ -1128,6 +1169,25 @@ class TenderAnalyzer:
                 )
                 tender_info["needs_manual_review"] = True
                 return
+            
+        agent_type = str(extracted.get("type") or "").lower().strip()
+        if agent_type in ("other", "unknown", "непрофильный"):
+            note0 = ""
+            notes = extracted.get("agent_notes") or []
+            if isinstance(notes, list) and notes:
+                note0 = str(notes[0])
+            reason = note0 or f"Агент вернул type={agent_type} (непрофильный предмет)"
+            logger.warning(
+                f"[{self.VERSION}] Агент type={agent_type} → block ({tender_id})"
+            )
+            agent_logger.warning(f"🚫 Агент type={agent_type}: {reason}")
+            tender_info["agent_blocked"] = True
+            tender_info["agent_block_reason"] = reason
+            tender_info["needs_manual_review"] = True
+            tender_info["type"] = agent_type
+            if notes:
+                tender_info["agent_notes"] = notes
+            return
 
     # ==================== Утилиты ====================
 
