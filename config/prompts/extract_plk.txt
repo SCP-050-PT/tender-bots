@@ -1,8 +1,9 @@
 [TYPE_HINT: plk]
 === EXTRACT_PLK ===
-- measurement_points: точки замеров (ИТОГО/таблица).
+- measurement_points: точки замеров (ИТОГО/таблица / сумма «N замер»).
 - measurement_types: список строк как в ТЗ (шум, микроклимат, …). Пиши «неионизирующие», не сокращай до «ионизир».
-- addresses_count, cities_count: по списку; нет → 1.
+- addresses_count, cities_count: по списку объектов; нет списка → 1.
+- НЕ путай количество точек с ценой за точку.
 
 JSON:
-{"type":"plk","measurement_points":число|null,"measurement_types":["..."],"addresses_count":число,"cities_count":число,"confidence":0.0-1.0, "cities":[...],"addresses":[...],"agent_notes":["..."].}
+{"type":"plk","measurement_points":число|null,"measurement_types":["..."],"addresses_count":число,"cities_count":число,"regions_count":число,"cities":["..."],"addresses":["..."],"confidence":0.0-1.0,"agent_notes":["...","..."]}

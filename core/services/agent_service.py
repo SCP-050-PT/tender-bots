@@ -122,8 +122,7 @@ class AgentService:
 
         cleaned = re.sub(r"```(?:json)?", "", text, flags=re.IGNORECASE).strip()
 
-        try:
-            parsed = json.loads(cleaned)
+        def _norm_notes(parsed: dict) -> dict:
             notes = parsed.get("agent_notes")
             if isinstance(notes, str) and notes.strip():
                 parsed["agent_notes"] = [notes.strip()[:400]]
@@ -134,15 +133,20 @@ class AgentService:
             else:
                 parsed["agent_notes"] = []
             return parsed
+
+        try:
+            parsed = json.loads(cleaned)
+            if isinstance(parsed, dict):
+                return _norm_notes(parsed)
         except json.JSONDecodeError:
             pass
 
-        json_match = re.search(r"\{.*?\}", cleaned, re.DOTALL)
+        json_match = re.search(r"\{.*\}", cleaned, re.DOTALL)
         if json_match:
             try:
                 parsed = json.loads(json_match.group())
                 if isinstance(parsed, dict):
-                    return parsed
+                    return _norm_notes(parsed)
             except json.JSONDecodeError:
                 pass
 
@@ -194,7 +198,8 @@ class AgentService:
 
 Кратко перечисли tool_results, затем строго JSON:
 type, rm_total / opr_positions / measurement_points / students_count,
-addresses_count, cities_count, regions_count, has_iii, confidence.
+addresses_count, cities_count, regions_count,
+cities[], addresses[], agent_notes[2-5 строк], has_iii, confidence.
 Не выдумывай числа без tool_results.
 """
             parts = [

@@ -6,11 +6,11 @@ v8.1.0-Separated Services:
   - Четкое разделение: TenderClassifierService (старый YandexGPT) для типа тендера,
     AgentService (AI Studio Agent) для анализа ТЗ.
 
-v8.1.1 (30.09):
-  - PLK: сумма «N замер» из ООЗ (text_zamer_sum) без раннего return при пустом Excel
-  - TRUSTED_SOURCES: text_zamer_sum, text_regex
-  - Агент не затирает qty null-ом; sanity не сбрасывает trusted PLK qty
-  - GEO 2a: addresses_count = cities парсера при cap
+v8.1.2 (07.10):
+  - TRUSTED_QTY: ktru, text_zamer_sum, excel, explicit_rm (без text_regex)
+  - _looks_like_unit_price: отсев 1000/1500 как qty
+  - GEO: без капа при явном списке cities/addresses; порядок списков до капа
+  - agent_notes → details + комментарий Sheets
 """
 
 import json
@@ -39,7 +39,7 @@ agent_logger = logger.bind(type="agent_thinking")
 class TenderAnalyzer:
     """Фасад для анализа тендеров v8.1.0"""
 
-    VERSION = "v8.1.1-Separated"
+    VERSION = "v8.1.2-Separated"
 
     ETP_COMMISSION_RATES = {
         "ртс-тендер": 1.0,
@@ -60,8 +60,22 @@ class TenderAnalyzer:
         "ktru",
         "text_zamer_sum",
         "excel",
-        "explicit_rm",      # «количество рабочих мест: N»
+        "explicit_rm",  # «количество рабочих мест: N»
     )
+
+    @staticmethod
+    def _looks_like_unit_price(val: int, nmck: float) -> bool:
+        """1000/1500 часто цена за ед., а не qty."""
+        if not val or val < 100:
+            return False
+        if nmck and nmck > 0:
+            # если val * небольшое целое ≈ НМЦК — скорее цена
+            for n in range(5, 2000):
+                if abs(val * n - nmck) / nmck < 0.08:
+                    return True
+            if val > nmck * 0.15:
+                return True
+        return val in (500, 800, 900, 1000, 1200, 1500, 1800, 2000, 2130, 2300)
 
     def __init__(
         self,
@@ -175,6 +189,7 @@ class TenderAnalyzer:
             return max(pool)
 
             # --- OPR ---
+
         if tender_type == "opr" and not (
             tender_info.get("opr_positions") or tender_info.get("opr_persons")
         ):
@@ -228,6 +243,16 @@ class TenderAnalyzer:
                             f"[{self.VERSION}] Text→opr_positions={qty} "
                             f"(cands={sorted(set(cands))[:10]})"
                         )
+
+            if (
+                qty
+                and src == "text_regex"
+                and self._looks_like_unit_price(int(qty), nmck)
+            ):
+                logger.warning(
+                    f"[{self.VERSION}] text_regex OPR qty={qty} похоже на цену — отброшен"
+                )
+                qty = None
 
             if qty:
                 tender_info["opr_positions"] = qty
@@ -322,6 +347,16 @@ class TenderAnalyzer:
                             f"[{self.VERSION}] Text→measurement_points={qty} "
                             f"(cands={sorted(set(cands))[:8]})"
                         )
+
+            if (
+                qty
+                and src == "text_regex"
+                and self._looks_like_unit_price(int(qty), nmck)
+            ):
+                logger.warning(
+                    f"[{self.VERSION}] text_regex PLK qty={qty} похоже на цену — отброшен"
+                )
+                qty = None
 
             if qty:
                 tender_info["measurement_points"] = qty
@@ -507,6 +542,7 @@ class TenderAnalyzer:
             guards=guards,
             extra_costs=extra_costs,
             limits_result=limits_result,
+            agent_notes=tender_info.get("agent_notes") or [],
         )
 
         agent_logger.info(
@@ -533,6 +569,7 @@ class TenderAnalyzer:
             "opr_positions_source",
             "points_source",
             "students_count_source",
+            "agent_notes",
         ):
             if tender_info.get(k) is not None:
                 details_out[k] = tender_info[k]
@@ -598,6 +635,7 @@ class TenderAnalyzer:
             documents_text=truncated_text,
             tender_id=tender_id,
             context_override=json.dumps(parser_context, ensure_ascii=False),
+            nmck=float(tender_info.get("nmck") or 0),
         )
 
         if extracted and extracted.get("blocked_by_error"):
@@ -716,6 +754,32 @@ class TenderAnalyzer:
             else:
                 logger.info(f"[{self.VERSION}] ✅ Подтверждено агентом: {key}={value}")
                 agent_logger.info(f"✅ ПОДТВЕРЖДЕНО: {key}={value}")
+
+        agent_type = (extracted.get("type") or "").lower().strip()
+        if agent_type in ("other", "unknown", "непрофильный"):
+            logger.warning(
+                f"[{self.VERSION}] Агент type={agent_type} → блокируем "
+                f"(было {tender_type})"
+            )
+            agent_logger.warning(f"🚫 Агент переопределил тип → {agent_type}")
+            tender_info["agent_blocked"] = True
+            tender_info["agent_block_reason"] = (
+                extracted.get("agent_notes")
+                and f"Агент: непрофильный предмет. {extracted['agent_notes'][0]}"
+                or f"Агент вернул type={agent_type}"
+            )
+            tender_info["needs_manual_review"] = True
+            return  # не считать education/sout по ошибке
+        
+        # agent_notes от модели
+        notes = extracted.get("agent_notes")
+        if isinstance(notes, list) and notes:
+            tender_info["agent_notes"] = [
+                str(x).strip()[:300] for x in notes if str(x).strip()
+            ][:8]
+            agent_logger.info(f"📝 agent_notes: {tender_info['agent_notes']}")
+        elif isinstance(notes, str) and notes.strip():
+            tender_info["agent_notes"] = [notes.strip()[:400]]
 
         if tender_info.get("measurement_points") and not tender_info.get(
             "points_count"
@@ -905,37 +969,7 @@ class TenderAnalyzer:
                 f"cities={agent_city_list or agent_addr_list}"
             )
 
-        cities = max(
-            int(tender_info.get("cities_count") or 1),
-            int(tender_info.get("addresses_count") or 1),
-        )
-        regions = int(tender_info.get("regions_count") or 1)
-        capped = min(cities, 3) if regions <= 1 else min(cities, 4)
-        if cities > capped:
-            logger.warning(
-                f"[{self.VERSION}] Гео-кап: {cities} → {capped} (regions={regions})"
-            )
-            agent_logger.warning(f"📍 Гео-кап: {cities} → {capped}")
-            tender_info["cities_count"] = capped
-            tender_info["addresses_count"] = capped
-
-        logger.info(
-            f"[{self.VERSION}] GEO ИТОГ {tender_id}: "
-            f"addresses={tender_info.get('addresses_count')} "
-            f"cities={tender_info.get('cities_count')} "
-            f"regions={tender_info.get('regions_count')} "
-            f"remote={tender_info.get('is_remote_region')}"
-        )
-        agent_logger.info(
-            f"📍 GEO ИТОГ: a={tender_info.get('addresses_count')} "
-            f"c={tender_info.get('cities_count')} "
-            f"r={tender_info.get('regions_count')}"
-        )
-
-        region = (
-            tender_info.get("region") or tender_info.get("customer_region") or ""
-        ).lower()
-        # --- Списки городов/адресов для Sheets (колонка «Адреса») ---
+        # --- Списки городов/адресов СНАЧАЛА (до капа) ---
         final_cities: List[str] = []
         final_addrs: List[str] = []
 
@@ -953,13 +987,38 @@ class TenderAnalyzer:
         if not final_addrs and p_addr_list:
             final_addrs = [str(a).strip() for a in p_addr_list if str(a).strip()]
 
-        # после geo-cap числа могли уменьшиться — списки обрезаем
-        cap_c = int(tender_info.get("cities_count") or 0) or len(final_cities)
-        if final_cities and cap_c > 0:
-            final_cities = final_cities[: max(cap_c, 3)]
-        if final_addrs:
-            final_addrs = final_addrs[:10]
+        cities = max(
+            int(tender_info.get("cities_count") or 1),
+            int(tender_info.get("addresses_count") or 1),
+        )
+        regions = int(tender_info.get("regions_count") or 1)
+        has_explicit_list = bool(final_cities or final_addrs or agent_has_list)
 
+        if has_explicit_list:
+            if final_cities:
+                tender_info["cities_count"] = len(final_cities)
+            if final_addrs:
+                tender_info["addresses_count"] = max(
+                    int(tender_info.get("addresses_count") or 0), len(final_addrs)
+                )
+            logger.info(
+                f"[{self.VERSION}] GEO без капа (есть список): "
+                f"cities={tender_info.get('cities_count')} "
+                f"addr={tender_info.get('addresses_count')}"
+            )
+        else:
+            capped = min(cities, 3) if regions <= 1 else min(cities, 4)
+            if cities > capped:
+                logger.warning(
+                    f"[{self.VERSION}] Гео-кап: {cities} → {capped} "
+                    f"(regions={regions}, без списка)"
+                )
+                agent_logger.warning(f"📍 Гео-кап: {cities} → {capped}")
+                tender_info["cities_count"] = capped
+                tender_info["addresses_count"] = capped
+
+        if final_addrs:
+            final_addrs = final_addrs[:15]
         if final_cities:
             tender_info["cities"] = final_cities
             tender_info["cities_list"] = final_cities
@@ -968,9 +1027,21 @@ class TenderAnalyzer:
             tender_info["addresses_list"] = final_addrs
 
         logger.info(
-            f"[{self.VERSION}] GEO lists → Sheets: cities={final_cities} "
-            f"addresses={final_addrs[:3]}..."
+            f"[{self.VERSION}] GEO ИТОГ {tender_id}: "
+            f"addresses={tender_info.get('addresses_count')} "
+            f"cities={tender_info.get('cities_count')} "
+            f"regions={tender_info.get('regions_count')} "
+            f"lists_cities={final_cities} lists_addr={final_addrs[:3]}"
         )
+        agent_logger.info(
+            f"📍 GEO ИТОГ: a={tender_info.get('addresses_count')} "
+            f"c={tender_info.get('cities_count')} "
+            f"r={tender_info.get('regions_count')} cities={final_cities}"
+        )
+
+        region = (
+            tender_info.get("region") or tender_info.get("customer_region") or ""
+        ).lower()
         home_markers = ("свердлов", "екатеринбург", "екат")
         tender_info["is_remote_region"] = bool(region) and not any(
             h in region for h in home_markers
@@ -1144,6 +1215,7 @@ class TenderAnalyzer:
         guards: List[str],
         extra_costs: dict = None,
         limits_result: dict = None,
+        agent_notes: List[str] = None,
     ) -> str:
         lines = [
             f"Анализ тендера типа «{tender_type}»",
@@ -1211,5 +1283,11 @@ class TenderAnalyzer:
         if result.review_reason:
             lines.append("")
             lines.append(f"⚠️ {result.review_reason}")
+
+        if agent_notes:
+            lines.append("")
+            lines.append("Мысли агента:")
+            for n in agent_notes[:5]:
+                lines.append(f"  • {n}")
 
         return "\n".join(lines)

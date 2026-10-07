@@ -1,7 +1,9 @@
 [TYPE_HINT: combined]
 === EXTRACT_COMBINED ===
-Заполни только присутствующие блоки; остальные null. Географию — в каждом блоке, где уместно.
+Заполни только присутствующие блоки; остальные null. Географию — на верхнем уровне.
 - rm_total и/или opr_positions: если в НМЦК две строки (СОУТ + ОПР) с одним кол-вом — одно число на оба.
 - type: "combined"
+- НЕ путай qty с ценой за ед.
+
 JSON:
-{"type":"combined","sout":{...}|null,"plk":{...}|null,"education":{...}|null,"opr":{...}|null,"confidence":0.0-1.0,"cities":[...],"addresses":[...],"agent_notes":["..."].}
+{"type":"combined","sout":{...}|null,"plk":{...}|null,"education":{...}|null,"opr":{...}|null,"rm_total":число|null,"opr_positions":число|null,"confidence":0.0-1.0,"cities":["..."],"addresses":["..."],"agent_notes":["...","..."]}
