@@ -124,8 +124,16 @@ class AgentService:
 
         try:
             parsed = json.loads(cleaned)
-            if isinstance(parsed, dict):
-                return parsed
+            notes = parsed.get("agent_notes")
+            if isinstance(notes, str) and notes.strip():
+                parsed["agent_notes"] = [notes.strip()[:400]]
+            elif isinstance(notes, list):
+                parsed["agent_notes"] = [
+                    str(x).strip()[:300] for x in notes if str(x).strip()
+                ][:8]
+            else:
+                parsed["agent_notes"] = []
+            return parsed
         except json.JSONDecodeError:
             pass
 
@@ -205,7 +213,10 @@ addresses_count, cities_count, regions_count, has_iii, confidence.
         parts = [
             header,
             verification_block,
+            f"Тип (подсказка): {tender_type}\n",
+            f"НМЦК (справка): {nmck:,.0f} ₽\n" if nmck else "",
             f"Текст тендера:\n{(documents_text or '')[:text_limit]}",
-            "\nВерни результат строго в JSON.",
+            "\nВерни ОДИН JSON: type, qty-поля, addresses_count, cities_count, "
+            "regions_count, cities[], addresses[], agent_notes[2-5 строк], confidence.",
         ]
         return "".join(parts)

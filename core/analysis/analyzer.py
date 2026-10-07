@@ -58,11 +58,9 @@ class TenderAnalyzer:
     # Источники qty, которые агент не имеет права перебить
     TRUSTED_QTY_SOURCES = (
         "ktru",
-        "excel",
-        "excel_nmck",
-        "excel_table",
         "text_zamer_sum",
-        "text_regex",
+        "excel",
+        "explicit_rm",      # «количество рабочих мест: N»
     )
 
     def __init__(
