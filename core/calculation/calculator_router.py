@@ -465,8 +465,14 @@ class CalculatorRouter:
             guarantee_cost=total_guarantee,
             needs_manual_review=True,
             review_reason=f"Комбинированный тендер ({'+'.join(subtypes)}) — требуется ручная проверка",
-            details={"parts": parts, "subtypes": subtypes},
-        )
+            details={
+            "type": "combined",
+            "subtypes": subtypes,
+            "rm_total": info.get("rm_total"),
+            "opr_positions": info.get("opr_positions") or info.get("opr_persons"),
+            "rm_total_source": info.get("rm_total_source"),
+            "opr_positions_source": info.get("opr_positions_source"),},
+                )
 
     def _manual_review(self, reason: str) -> CalculationResult:
         return CalculationResult(

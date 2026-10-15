@@ -452,14 +452,17 @@ class TenderAnalyzer:
                 or tender_info.get("students_count_source")
                 or tender_info.get("opr_positions_source")
                 or tender_info.get("points_source")
+                or tender_info.get("measurement_points_source")
                 or ""
             )
             if "nmck_estimate" in str(src).lower():
                 tender_info["needs_manual_review"] = True
-                # опционально жёстко: чтобы decision не был «рекомендуется»
-                # передаётся в risk_analyzer уже через needs_manual_review
-            
-        
+                prev = (tender_info.get("review_reason") or "").strip()
+                note = "Объём оценён по НМЦК — проверить вручную"
+                if note not in prev:
+                    tender_info["review_reason"] = (
+                        f"{prev} | {note}".strip(" |") if prev else note
+                    )
 
         nmck = tender_info.get("nmck", 0)
         deadline_days = tender_info.get("deadline_days", 30)
@@ -686,6 +689,18 @@ class TenderAnalyzer:
             tender_info["needs_manual_review"] = True
             return
 
+        if extracted.get("has_iii") is True or extracted.get("has_iii") == "true":
+            tender_info["has_iii"] = True
+            tender_info["needs_manual_review"] = True
+            prev = (tender_info.get("review_reason") or "").strip()
+            note = "В ТЗ признаки ИИИ/рентген — заложить субподряд или проверить аккредитацию"
+            if note not in prev:
+                tender_info["review_reason"] = (
+                    f"{prev} | {note}".strip(" |") if prev else note
+                )
+            # не блокируем жёстко (есть субподряд), но не «рекомендуется» без глаз:
+            # needs_manual_review уже поднимет risk → «осторожно»
+        
         agent_logger.info(f"🔄 СРАВНЕНИЕ ДАННЫХ ПАРСЕРА И АГЕНТА ДЛЯ {tender_id}:")
         pre_agent_students = int(tender_info.get("students_count") or 0)
 
@@ -734,8 +749,6 @@ class TenderAnalyzer:
                 )
                 agent_logger.warning(f"⚠️ NULL от агента: {qk}")
 
-        
-        
         for key, value in extracted.items():
             # null / служебные — не затираем уже найденное
             if value is None or key.startswith("_"):
@@ -939,6 +952,24 @@ class TenderAnalyzer:
             tender_info["needs_manual_review"] = True
             return
 
+        # has_iii от агента → осторожно / субподряд (не авто-рекомендация)
+        if extracted.get("has_iii") is True or str(extracted.get("has_iii")).lower() == "true":
+            tender_info["has_iii"] = True
+            tender_info["needs_manual_review"] = True
+            prev = (tender_info.get("review_reason") or "").strip()
+            note = (
+                "В ТЗ признаки ИИИ/рентген — заложить субподряд "
+                "или проверить аккредитацию"
+            )
+            if note not in prev:
+                tender_info["review_reason"] = (
+                    f"{prev} | {note}".strip(" |") if prev else note
+                )
+            logger.warning(
+                f"[{self.VERSION}] has_iii=true → needs_manual_review ({tender_id})"
+            )
+            agent_logger.warning(f"⚠️ has_iii: {note}")
+        
         # === География ===
         parser_geo = AddressParser().count_addresses(documents_text or "")
         agent_addr = int(tender_info.get("addresses_count") or 0)
@@ -946,7 +977,12 @@ class TenderAnalyzer:
         p_cities = int(parser_geo.get("cities_count") or 0)
         p_regions = int(parser_geo.get("regions_count") or 1)
         p_reliable = bool(parser_geo.get("is_reliable"))
-        p_city_list = parser_geo.get("cities") or parser_geo.get("city_list") or []
+        p_city_list = (
+            parser_geo.get("unique_cities")
+            or parser_geo.get("cities")
+            or parser_geo.get("city_list")
+            or []
+        )
         p_addr_list = (
             parser_geo.get("addresses") or parser_geo.get("address_list") or []
         )
@@ -977,6 +1013,10 @@ class TenderAnalyzer:
             tender_info["addresses_count"] = p_cities
             tender_info["cities_count"] = p_cities
             tender_info["regions_count"] = max(1, p_regions)
+            # пробросить имена в details/Sheets
+            if p_city_list:
+                tender_info["cities"] = list(p_city_list)
+                tender_info["cities_list"] = list(p_city_list)
             logger.warning(
                 f"[{self.VERSION}] Гео: агент=1, берём AddressParser "
                 f"({p_cities} городов, {p_regions} регионов) → {p_city_list}"
@@ -1169,7 +1209,7 @@ class TenderAnalyzer:
                 )
                 tender_info["needs_manual_review"] = True
                 return
-            
+
         agent_type = str(extracted.get("type") or "").lower().strip()
         if agent_type in ("other", "unknown", "непрофильный"):
             note0 = ""

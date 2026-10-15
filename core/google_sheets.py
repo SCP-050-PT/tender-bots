@@ -121,7 +121,26 @@ def build_sheets_row(analysis, detail, tender) -> Dict[str, str]:
         ad = analysis.details if isinstance(analysis.details, dict) else {}
 
     if detail:
-        if t_type in ("sout", "combined"):
+        if t_type == "combined":
+            parts = []
+            rm = getattr(detail, "rm_total", None) or ad.get("rm_total")
+            opr = (
+                getattr(detail, "opr_positions", None)
+                or ad.get("opr_positions")
+                or ad.get("opr_persons")
+            )
+            pts = ad.get("measurement_points") or ad.get("points_count")
+            st = ad.get("students_count")
+            if rm:
+                parts.append(f"{rm} РМ")
+            if opr:
+                parts.append(f"{opr} должн.")
+            if pts:
+                parts.append(f"{pts} точ.")
+            if st:
+                parts.append(f"{st} чел.")
+            quantity = " + ".join(parts) if parts else None
+        elif t_type == "sout":
             quantity = getattr(detail, "rm_total", None) or ad.get("rm_total")
         elif t_type == "plk":
             quantity = getattr(detail, "points_count", None) or ad.get(
@@ -140,7 +159,22 @@ def build_sheets_row(analysis, detail, tender) -> Dict[str, str]:
             )
 
     if not quantity:
-        if t_type in ("sout", "combined"):
+        if t_type == "combined":
+            parts = []
+            if ad.get("rm_total"):
+                parts.append(f"{ad['rm_total']} РМ")
+            if ad.get("opr_positions") or ad.get("opr_persons"):
+                parts.append(
+                    f"{ad.get('opr_positions') or ad.get('opr_persons')} должн."
+                )
+            if ad.get("measurement_points") or ad.get("points_count"):
+                parts.append(
+                    f"{ad.get('measurement_points') or ad.get('points_count')} точ."
+                )
+            if ad.get("students_count"):
+                parts.append(f"{ad['students_count']} чел.")
+            quantity = " + ".join(parts) if parts else None
+        elif t_type == "sout":
             quantity = ad.get("rm_total")
         elif t_type == "plk":
             quantity = ad.get("measurement_points") or ad.get("points_count")
@@ -148,6 +182,7 @@ def build_sheets_row(analysis, detail, tender) -> Dict[str, str]:
             quantity = ad.get("students_count")
         elif t_type == "opr":
             quantity = ad.get("opr_positions") or ad.get("opr_persons")
+
     if not quantity:
         quantity = "?"
     quantity = str(quantity)

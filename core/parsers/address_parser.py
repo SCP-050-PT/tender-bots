@@ -275,7 +275,11 @@ class AddressParser:
             "regions_count": total_regions,
             "trips": trips,
             "unique_cities": sorted(validated),
+            "cities": sorted(validated),          # алиас
+            "city_list": sorted(validated),       # алиас
             "regions": sorted(list(all_regions)),
+            "addresses": [],                      # пока нет полноценных адресов
+            "address_list": [],
             "needs_manual_check": needs_manual_check,
             "is_reliable": is_reliable,
         }

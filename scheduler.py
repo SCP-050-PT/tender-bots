@@ -20,7 +20,7 @@ from loguru import logger
 
 # === НАСТРОЙКИ ===
 INTERVAL_HOURS = 4  # Интервал между запусками
-MAX_RESULTS = 10  # Максимум тендеров за запуск
+MAX_RESULTS = 6  # Максимум тендеров за запуск
 MAX_CONSECUTIVE_FAILURES = 3  # Максимум подряд идущих ошибок
 RESTART_DELAY_SECONDS = 60  # Задержка перед перезапуском после краша
 HEALTH_PORT = 8080  # Порт health-check сервера
@@ -253,7 +253,12 @@ def main():
                 consecutive_failures = 0  # Сброс после паузы
                 logger.info("🔄 Сброс счётчика ошибок, продолжаем работу")
 
-            next_run = now + timedelta(hours=INTERVAL_HOURS)
+            base = datetime.now().replace(minute=0, second=0, microsecond=0)
+            next_hour = ((base.hour // INTERVAL_HOURS) + 1) * INTERVAL_HOURS
+            if next_hour >= 24:
+                next_run = base.replace(hour=0) + timedelta(days=1)
+            else:
+                next_run = base.replace(hour=next_hour)
             logger.info(
                 f"⏭️  Следующий запуск: {next_run.strftime('%Y-%m-%d %H:%M:%S')}"
             )

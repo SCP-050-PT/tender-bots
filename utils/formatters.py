@@ -259,6 +259,29 @@ def build_calculation_breakdown(analysis: Any) -> str:
         else:
             lines.append("Транспорт: 0₽ (1 адрес или нет данных)")
 
+    elif tender_type == "combined":
+        lines.append("Тип: combined (СОУТ + ОПР)")
+        if details.get("rm_total"):
+            lines.append(
+                f"СОУТ: {details.get('rm_total')} РМ "
+                f"({_label_source(details.get('rm_total_source'))})"
+            )
+        opr = details.get("opr_positions") or details.get("opr_persons")
+        if opr:
+            lines.append(
+                f"ОПР: {opr} должн. "
+                f"({_label_source(details.get('opr_positions_source'))})"
+            )
+        pts = details.get("measurement_points") or details.get("points_count")
+        if pts:
+            lines.append(f"ПЛК: {pts} точ.")
+        st = details.get("students_count")
+        if st:
+            lines.append(f"Обучение: {st} чел.")
+        parts = details.get("combined_parts") or details.get("subtypes") or []
+        if parts:
+            lines.append("Части: " + ", ".join(str(p) for p in parts))
+
     else:
         lines.append(f"[?] Тип: {tender_type}")
 

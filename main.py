@@ -547,7 +547,7 @@ def run_analyze(
     if type_skipped:
         logger.info(f"   • Пропущено по type_filter: {type_skipped}")
 
-    limiter.record_tenders(len(results))
+    limiter.record_tenders(added_to_sheets_count)
     return results, sheets_rows
 
 
